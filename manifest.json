@@ -1,0 +1,9 @@
+{
+  "id": "tasknotes-omnifocus",
+  "name": "TaskNotes ⇄ OmniFocus",
+  "version": "0.1.0",
+  "minAppVersion": "1.7.2",
+  "description": "Bidirectionally sync opted-in TaskNotes tasks with OmniFocus. Desktop only.",
+  "author": "Nelson Love",
+  "isDesktopOnly": true
+}
