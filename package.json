@@ -1,6 +1,6 @@
 {
   "name": "tasknotes-omnifocus",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Obsidian plugin that bidirectionally syncs opted-in TaskNotes tasks with OmniFocus.",
   "type": "module",
   "main": "main.js",
@@ -11,7 +11,12 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": ["obsidian", "tasknotes", "omnifocus", "sync"],
+  "keywords": [
+    "obsidian",
+    "tasknotes",
+    "omnifocus",
+    "sync"
+  ],
   "author": "Nelson Love",
   "license": "MIT",
   "devDependencies": {

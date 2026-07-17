@@ -70,6 +70,7 @@ export function normalizeTNTask(raw: RawTNTask, completedStatuses: string[]): Ta
     priority: mapTNPriority(raw.priority),
     tags: raw.tags ?? [],
     contexts: raw.contexts ?? [],
+    projects: raw.projects ?? [],
     omnifocusUrl: null,
     inScope: true,
   };

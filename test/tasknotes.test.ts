@@ -67,6 +67,7 @@ describe("normalizeTNTask", () => {
       priority: "high",
       tags: ["x"],
       contexts: ["@home"],
+      projects: [],
       omnifocusUrl: null,
       inScope: true,
     });
@@ -75,6 +76,11 @@ describe("normalizeTNTask", () => {
   it("derives isCompleted from the completed-status set", () => {
     expect(normalizeTNTask(rawTN({ status: "done" }), COMPLETED).isCompleted).toBe(true);
     expect(normalizeTNTask(rawTN({ status: "open" }), COMPLETED).isCompleted).toBe(false);
+  });
+
+  it("preserves the projects (parent) links", () => {
+    expect(normalizeTNTask(rawTN({ projects: ["[[Parent]]"] }), COMPLETED).projects).toEqual(["[[Parent]]"]);
+    expect(normalizeTNTask(rawTN(), COMPLETED).projects).toEqual([]);
   });
 
   it("uses null for absent body/dates and [] for absent tags/contexts", () => {

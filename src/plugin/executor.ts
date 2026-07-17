@@ -133,6 +133,7 @@ export async function executePlan(plan: Plan, deps: ExecDeps): Promise<ExecResul
         // Paired delete — only clear if delete succeeded
         if (batchResult.deleted.includes(pk)) {
           store.clearLinkByTaskId(mut.taskId);
+          store.deleteSnapshot(pk); // don't leave the snapshot orphaned in data.json
           applied++;
         } else {
           // Delete failed — keep the link and record an error
@@ -146,6 +147,7 @@ export async function executePlan(plan: Plan, deps: ExecDeps): Promise<ExecResul
       } else {
         // Unpaired clearLink — clear unconditionally
         store.clearLinkByTaskId(mut.taskId);
+        if (pk !== undefined) store.deleteSnapshot(pk); // drop the now-dead snapshot too
         applied++;
       }
     } else if (mut.kind === "updateTask") {

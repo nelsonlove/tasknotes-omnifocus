@@ -4,11 +4,21 @@ import { buildReconcileInput, deriveSnapshot } from "./sync.js";
 import { executePlan } from "./executor.js";
 import { DEFAULT_SETTINGS, SettingTab } from "./settings.js";
 import type { TaskNotesOmnifocusSettings } from "./settings.js";
-import { buildProjectMembershipFilter, filterIgnored, computeDesurfaceIds } from "./projects.js";
+import { filterIgnored, computeDesurfaceIds } from "./projects.js";
+import {
+  buildHasParentFilter,
+  buildHasSubtasksFilter,
+  buildProjectNodeInputs,
+  computeIgnoredTitles,
+  pruneIgnored,
+} from "./discovery.js";
+import { buildOFTree, flattenFolders, flattenProjects } from "./tree.js";
 import { createTaskNotesAdapter } from "../adapters/tasknotes.js";
 import { createOmniFocusAdapter, defaultRunOmniJS } from "../adapters/omnifocus.js";
+import type { FolderSpec, OFOp, ProjectSpec, ScaffoldResult } from "../adapters/omnifocus.js";
 import { reconcile } from "../core/reconcile.js";
-import type { ReconcileConfig } from "../core/types.js";
+import { reconcileProjectMeta } from "../core/reconcileProject.js";
+import type { OmniFocusTask, ReconcileConfig, TaskNote } from "../core/types.js";
 
 export default class TaskNotesOmniFocusPlugin extends Plugin {
   declare settings: TaskNotesOmnifocusSettings;
@@ -76,29 +86,52 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         authToken: this.settings.authToken,
       });
       const omnifocus = createOmniFocusAdapter(defaultRunOmniJS);
+      const ignoreTag = this.settings.ignoreTag;
+
+      // --- 1. Discover the whole TaskNotes project forest in two queries. ---
+      const projectNodes = await tasknotes.query(buildHasSubtasksFilter());
+      const childTasks = await tasknotes.query(buildHasParentFilter());
+
+      // --- 2. Build the OmniFocus folder/project tree (pure), honoring the ignore blacklist. ---
+      const { inputs, leafById } = buildProjectNodeInputs(projectNodes, childTasks);
+      const ignored = computeIgnoredTitles(projectNodes, ignoreTag);
+      const roots = buildOFTree(pruneIgnored(inputs, ignored));
+      const ofFolders = flattenFolders(roots);
+      const ofProjects = flattenProjects(roots);
+
+      const folderSpecs: FolderSpec[] = ofFolders.map((f) => ({ path: [...f.path, f.title] }));
+      const projectSpecs: ProjectSpec[] = ofProjects.map((p) => ({ title: p.title, folderPath: p.path }));
+
+      // --- 3. Ensure every folder/project exists before reconciling tasks into it. ---
+      let scaffold: ScaffoldResult = { createdFolders: [], createdProjects: [], errors: [] };
+      if (!dryRun) {
+        scaffold = await omnifocus.ensureStructure(folderSpecs, projectSpecs);
+      }
 
       let totalApplied = 0;
       let totalConflicts = 0;
-      let totalErrors = 0;
+      let totalErrors = scaffold.errors.length;
       const dryRunSummaryLines: string[] = [];
 
       // Accumulate all member ids across all projects (for de-surface pass)
       const allMemberIds = new Set<string>();
       // Accumulate all OF tasks seen (for de-surface pass)
-      const allOfTasks = [];
+      const allOfTasks: OmniFocusTask[] = [];
 
-      // Per-project sync pass
-      for (const project of this.settings.syncedProjects) {
-        // Query members of this project, filtered by ignore tag
-        let members = await tasknotes.query(buildProjectMembershipFilter(project));
-        members = filterIgnored(members, this.settings.ignoreTag);
+      // --- 4. Reconcile each discovered project's leaf tasks into its same-named OF project. ---
+      for (const proj of ofProjects) {
+        const leaves = proj.leafTaskIds
+          .map((id) => leafById.get(id))
+          .filter((t): t is TaskNote => t !== undefined);
+        const members = filterIgnored(leaves, ignoreTag);
         members.forEach((m) => allMemberIds.add(m.id));
 
-        // Read OmniFocus project tasks
-        const ofTasks = await omnifocus.readProject(project);
+        // Nothing opted-in here — the (possibly newly-created) project just stays empty.
+        if (members.length === 0) continue;
+
+        const ofTasks = await omnifocus.readProject(proj.title);
         allOfTasks.push(...ofTasks);
 
-        // Build reconcile input
         const input = buildReconcileInput({
           direction,
           inScopeTasks: members,
@@ -106,7 +139,7 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
           ofTasks,
           store: this.store,
           config,
-          binding: { omnifocusProject: project },
+          binding: { omnifocusProject: proj.title },
         });
 
         const plan = reconcile(input);
@@ -118,33 +151,93 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
           const deletes = mutKinds.filter((k) => k === "deleteOFTask").length;
           const statuses = mutKinds.filter((k) => k === "setStatus").length;
           const clears = mutKinds.filter((k) => k === "clearLink").length;
-          dryRunSummaryLines.push(
-            `[${project}] ${creates} creates, ${updates} updates, ${deletes} deletes, ${statuses} status changes, ${clears} link clears, ${plan.conflicts.length} conflicts`,
-          );
+          if (plan.mutations.length > 0 || plan.conflicts.length > 0) {
+            dryRunSummaryLines.push(
+              `[${proj.title}] ${creates} creates, ${updates} updates, ${deletes} deletes, ${statuses} status changes, ${clears} link clears, ${plan.conflicts.length} conflicts`,
+            );
+          }
         } else {
           const result = await executePlan(plan, {
             omnifocus,
             tasknotes,
             store: this.store,
-            project,
+            project: proj.title,
           });
 
           totalApplied += result.applied;
           totalErrors += result.errors.length;
           totalConflicts += plan.conflicts.length;
 
-          // Re-snapshot: re-read this project's members + OF tasks
-          const freshMembers = filterIgnored(
-            await tasknotes.query(buildProjectMembershipFilter(project)),
-            this.settings.ignoreTag,
-          );
-          const freshOf = await omnifocus.readProject(project);
-          for (const m of freshMembers) {
+          // Re-snapshot: re-read this project's OF tasks and snapshot each linked member.
+          const freshOf = await omnifocus.readProject(proj.title);
+          for (const m of members) {
             const pk = this.store.getPrimaryKey(m.id);
             const ot = pk && freshOf.find((o) => o.primaryKey === pk);
             if (ot) {
               this.store.setSnapshot(deriveSnapshot(m, ot, config));
             }
+          }
+        }
+      }
+
+      // --- ENRICH pass: carry each project-node's OWN fields onto its OmniFocus project. ---
+      // A task with subtasks maps to an OF project (a container); enrich round-trips its own
+      // due/defer/flag/note/completion so it still surfaces. One read + one write spawn total.
+      const nodeById = new Map(projectNodes.map((n) => [n.id, n]));
+      const enrichNames = ofProjects.map((p) => p.title);
+      const metas = await omnifocus.readProjectsMeta(enrichNames);
+      const projectOps: OFOp[] = [];
+      const enrichSnapshots: { node: TaskNote; name: string }[] = [];
+      let enrichVaultWrites = 0;
+      let enrichConflicts = 0;
+
+      for (const proj of ofProjects) {
+        const nodeTask = nodeById.get(proj.sourceId);
+        if (!nodeTask) continue;
+        const meta = metas[proj.title];
+        if (!meta) continue; // project should exist post-scaffold; skip if not found
+        const pk = meta.primaryKey;
+        // Keep the node-link out of the de-surface pass (it isn't a leaf "member").
+        allMemberIds.add(nodeTask.id);
+        if (dryRun) {
+          const res = reconcileProjectMeta(nodeTask, meta, this.store.getSnapshot(pk), direction, config);
+          enrichConflicts += res.conflicts.length;
+          if (Object.keys(res.projectFields).length) projectOps.push({ op: "updateProject", primaryKey: pk, fields: res.projectFields });
+          continue;
+        }
+        this.store.setLink(nodeTask.id, pk);
+        const res = reconcileProjectMeta(nodeTask, meta, this.store.getSnapshot(pk), direction, config);
+        enrichConflicts += res.conflicts.length;
+        if (Object.keys(res.projectFields).length) projectOps.push({ op: "updateProject", primaryKey: pk, fields: res.projectFields });
+        if (Object.keys(res.vaultFields).length) {
+          try { await tasknotes.update(nodeTask.id, res.vaultFields); enrichVaultWrites++; }
+          catch { totalErrors++; }
+        }
+        if (res.setStatus) {
+          try { await tasknotes.setStatus(nodeTask.id, res.setStatus); enrichVaultWrites++; }
+          catch { totalErrors++; }
+        }
+        enrichSnapshots.push({ node: nodeTask, name: proj.title });
+      }
+
+      totalConflicts += enrichConflicts;
+      if (dryRun) {
+        if (projectOps.length || enrichConflicts) {
+          dryRunSummaryLines.push(`[enrich] ${projectOps.length} project-field updates, ${enrichConflicts} conflicts`);
+        }
+      } else {
+        if (projectOps.length) {
+          const br = await omnifocus.applyBatch(projectOps);
+          totalApplied += projectOps.length - br.errors.length;
+          totalErrors += br.errors.length;
+        }
+        totalApplied += enrichVaultWrites;
+        // Re-snapshot enriched projects from their fresh meta.
+        if (enrichSnapshots.length) {
+          const fresh = await omnifocus.readProjectsMeta(enrichSnapshots.map((e) => e.name));
+          for (const { node, name } of enrichSnapshots) {
+            const fm = fresh[name];
+            if (fm) this.store.setSnapshot(deriveSnapshot(node, fm, config));
           }
         }
       }
@@ -159,11 +252,20 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
             .filter((t): t is NonNullable<typeof t> => t !== null)
             .map((t) => ({ ...t, inScope: false }));
 
+          // Read the candidates' actual OmniFocus mirrors by primaryKey so reconcile can tell a task
+          // that merely left scope (mirror present -> delete/complete per policy) from one whose
+          // mirror is genuinely gone (absent -> clearLink). allOfTasks only covers projects that had
+          // in-scope members this run, so it is not sufficient on its own.
+          const desurfacePks = desurfaceIds
+            .map((id) => this.store.getPrimaryKey(id))
+            .filter((pk): pk is string => pk !== undefined);
+          const desurfaceOf = await omnifocus.readTasksByIds(desurfacePks);
+
           const input = buildReconcileInput({
             direction,
             inScopeTasks: [],
             desurfaceTasks,
-            ofTasks: allOfTasks,
+            ofTasks: [...allOfTasks, ...Object.values(desurfaceOf)],
             store: this.store,
             config,
             binding: { omnifocusProject: "" },
@@ -180,14 +282,14 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       }
 
       if (dryRun) {
-        const summary = dryRunSummaryLines.length
-          ? dryRunSummaryLines.join("\n")
-          : "No synced projects configured.";
-        new Notice(`TaskNotes⇄OmniFocus (dry run):\n${summary}`);
+        const header = `Discovered ${ofProjects.length} projects / ${ofFolders.length} folders (${projectNodes.length} nodes).`;
+        const body = dryRunSummaryLines.length ? dryRunSummaryLines.join("\n") : "No task changes.";
+        new Notice(`TaskNotes⇄OmniFocus (dry run):\n${header}\n${body}`);
       } else {
         await this.saveData({ settings: this.settings, state: this.store.toJSON() });
+        const created = scaffold.createdFolders.length + scaffold.createdProjects.length;
         new Notice(
-          `TaskNotes⇄OmniFocus: ${totalApplied} applied, ${totalConflicts} conflicts, ${totalErrors} errors`,
+          `TaskNotes⇄OmniFocus: ${created} folders/projects created, ${totalApplied} applied, ${totalConflicts} conflicts, ${totalErrors} errors`,
         );
       }
     } catch (err) {

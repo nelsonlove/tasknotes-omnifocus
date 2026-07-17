@@ -1,13 +1,18 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   buildBatchScript,
+  buildReadProjectsMetaScript,
   buildReadScript,
+  buildScaffoldScript,
   createOmniFocusAdapter,
   encodePayload,
   normalizeOFTask,
   type BatchResult,
+  type FolderSpec,
   type OFOp,
+  type ProjectSpec,
   type RawOFTask,
+  type ScaffoldResult,
 } from "../src/adapters/omnifocus.js";
 import type { OFWriteFields } from "../src/core/types.js";
 
@@ -92,6 +97,35 @@ describe("buildReadScript / buildBatchScript", () => {
     expect(script).toContain(encodePayload(ops));
     expect(script).toContain("JSON.stringify");
   });
+
+  it("batch script handles an updateProject op via Project.byIdentifier and Project.Status", () => {
+    const ops: OFOp[] = [{ op: "updateProject", primaryKey: "pk1", fields: { dueDate: null, completed: true } }];
+    const script = buildBatchScript(ops);
+    expect(script).toContain(encodePayload(ops));
+    expect(script).toContain("Project.byIdentifier");
+    expect(script).toContain("Project.Status");
+  });
+
+  it("read-projects-meta script embeds names via encodePayload and returns JSON", () => {
+    const script = buildReadProjectsMetaScript(["ProjA", "ProjB"]);
+    expect(script).toContain(encodePayload(["ProjA", "ProjB"]));
+    expect(script).toContain("JSON.stringify");
+    expect(script).toContain("flattenedProjects");
+  });
+
+  it("scaffold script embeds folders+projects via encodePayload and returns JSON", () => {
+    const folders: FolderSpec[] = [{ path: ["Area"] }, { path: ["Area", "MixedP"] }];
+    const projects: ProjectSpec[] = [
+      { title: "ProjA", folderPath: ["Area"] },
+      { title: "Solo", folderPath: [] },
+    ];
+    const script = buildScaffoldScript(folders, projects);
+    expect(script).toContain(encodePayload({ folders, projects }));
+    expect(script).toContain("JSON.stringify");
+    // Uses the folder/project constructors (pure OmniJS, not JXA).
+    expect(script).toContain("new Folder");
+    expect(script).toContain("new Project");
+  });
 });
 
 describe("adapter.readProject", () => {
@@ -142,5 +176,78 @@ describe("adapter.applyBatch", () => {
     const out = await adapter.applyBatch([]);
     expect(run).not.toHaveBeenCalled();
     expect(out).toEqual({ created: {}, updated: [], deleted: [], errors: [] });
+  });
+});
+
+describe("adapter.ensureStructure", () => {
+  it("runs one script and returns the parsed ScaffoldResult", async () => {
+    const result: ScaffoldResult = {
+      createdFolders: ["Area", "Area/MixedP"],
+      createdProjects: ["ProjA", "MixedP"],
+      errors: [],
+    };
+    const run = vi.fn().mockResolvedValue(JSON.stringify(result));
+    const adapter = createOmniFocusAdapter(run);
+    const out = await adapter.ensureStructure([{ path: ["Area"] }], [{ title: "ProjA", folderPath: ["Area"] }]);
+    expect(run).toHaveBeenCalledOnce();
+    expect(out.createdFolders).toEqual(["Area", "Area/MixedP"]);
+    expect(out.createdProjects).toEqual(["ProjA", "MixedP"]);
+    expect(out.errors).toEqual([]);
+  });
+
+  it("does no work and spawns nothing when there is nothing to ensure", async () => {
+    const run = vi.fn();
+    const adapter = createOmniFocusAdapter(run);
+    const out = await adapter.ensureStructure([], []);
+    expect(run).not.toHaveBeenCalled();
+    expect(out).toEqual({ createdFolders: [], createdProjects: [], errors: [] });
+  });
+
+  it("throws a clear error when the runner output is not valid JSON", async () => {
+    const run = vi.fn().mockResolvedValue("not json");
+    const adapter = createOmniFocusAdapter(run);
+    await expect(adapter.ensureStructure([{ path: ["A"] }], [])).rejects.toThrow(/omnifocus/i);
+  });
+});
+
+describe("adapter.readProjectsMeta", () => {
+  it("runs one script and normalizes each project's meta by name", async () => {
+    const raw: Record<string, RawOFTask> = {
+      ProjA: rawTask({ id: "pkA", name: "ProjA", due: "2026-08-01", flagged: true }),
+    };
+    const run = vi.fn().mockResolvedValue(JSON.stringify(raw));
+    const adapter = createOmniFocusAdapter(run);
+    const out = await adapter.readProjectsMeta(["ProjA", "Missing"]);
+    expect(run).toHaveBeenCalledOnce();
+    expect(out.ProjA.primaryKey).toBe("pkA");
+    expect(out.ProjA.dueDate).toBe("2026-08-01T00:00:00.000Z");
+    expect(out.ProjA.flagged).toBe(true);
+    expect(out.Missing).toBeUndefined();
+  });
+
+  it("spawns nothing for an empty name list", async () => {
+    const run = vi.fn();
+    const adapter = createOmniFocusAdapter(run);
+    expect(await adapter.readProjectsMeta([])).toEqual({});
+    expect(run).not.toHaveBeenCalled();
+  });
+});
+
+describe("adapter.readTasksByIds", () => {
+  it("runs one script and returns tasks normalized, keyed by primaryKey", async () => {
+    const raw: Record<string, RawOFTask> = { pkA: rawTask({ id: "pkA", completed: true }) };
+    const run = vi.fn().mockResolvedValue(JSON.stringify(raw));
+    const adapter = createOmniFocusAdapter(run);
+    const out = await adapter.readTasksByIds(["pkA", "gone"]);
+    expect(run).toHaveBeenCalledOnce();
+    expect(out.pkA.completed).toBe(true);
+    expect(out.gone).toBeUndefined();
+  });
+
+  it("spawns nothing for an empty id list", async () => {
+    const run = vi.fn();
+    const adapter = createOmniFocusAdapter(run);
+    expect(await adapter.readTasksByIds([])).toEqual({});
+    expect(run).not.toHaveBeenCalled();
   });
 });

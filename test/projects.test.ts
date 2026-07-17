@@ -14,6 +14,7 @@ const task = (o: Partial<TaskNote> = {}): TaskNote => ({
   priority: "none",
   tags: [],
   contexts: [],
+  projects: [],
   omnifocusUrl: null,
   inScope: true,
   ...o,

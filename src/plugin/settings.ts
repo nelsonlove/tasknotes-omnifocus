@@ -2,14 +2,12 @@ import { App, PluginSettingTab, Setting } from "obsidian";
 import type TaskNotesOmniFocusPlugin from "./main.js";
 
 export interface TaskNotesOmnifocusSettings {
-  /** Project-note titles (one per synced OmniFocus project). */
-  syncedProjects: string[];
-  /** Vault tag that opts a task OUT of OmniFocus sync. */
+  /** Vault tag that opts a task (or a project subtree) OUT of OmniFocus sync. */
   ignoreTag: string;
   /** Base URL for the TaskNotes API. */
   taskNotesApi: string;
   /** Conflict resolution strategy when both sides changed the same field in a sync. */
-  conflict: "vault-canonical" | "of-canonical";
+  conflict: "vault-canonical" | "of-canonical" | "flag-and-hold";
   /** How the OmniFocus task body is treated. */
   bodyPolicy: "create-only" | "of-canonical" | "bidirectional";
   /** What to do when a task leaves scope. */
@@ -30,12 +28,13 @@ export interface TaskNotesOmnifocusSettings {
 }
 
 export const DEFAULT_SETTINGS: TaskNotesOmnifocusSettings = {
-  syncedProjects: [],
   ignoreTag: "omnifocus/ignore",
   taskNotesApi: "http://localhost:8080",
   conflict: "vault-canonical",
   bodyPolicy: "create-only",
-  desurface: "delete",
+  // "complete" (not "delete") by default: when a task leaves scope (ignored/archived/moved out),
+  // mark its OmniFocus mirror done rather than destroying it — reversible, never loses OF-side data.
+  desurface: "complete",
   priorityTags: {
     enabled: true,
     map: {
@@ -91,14 +90,15 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Conflict resolution")
-      .setDesc("Which side wins when both vault and OmniFocus changed the same field during a sync.")
+      .setDesc("What happens when both vault and OmniFocus changed the same field during a sync.")
       .addDropdown((drop) =>
         drop
           .addOption("vault-canonical", "Vault wins")
           .addOption("of-canonical", "OmniFocus wins")
+          .addOption("flag-and-hold", "Flag & hold (leave both, report conflict)")
           .setValue(this.plugin.settings.conflict)
           .onChange(async (value) => {
-            this.plugin.settings.conflict = value as "vault-canonical" | "of-canonical";
+            this.plugin.settings.conflict = value as "vault-canonical" | "of-canonical" | "flag-and-hold";
             await this.plugin.saveSettings();
           }),
       );
@@ -188,27 +188,10 @@ export class SettingTab extends PluginSettingTab {
           }),
       );
 
-    containerEl.createEl("h3", { text: "Synced Projects" });
+    containerEl.createEl("h3", { text: "Scope" });
     containerEl.createEl("p", {
-      text: "One TaskNotes project-note title per line. Each project's tasks will be synced to a matching OmniFocus project of the same name.",
+      text: "The whole TaskNotes project hierarchy is synced automatically: nested projects become OmniFocus folders/projects, and each project's tasks sync into it. To exclude a project and its entire subtree, add the ignore tag (above) to that project note.",
       cls: "setting-item-description",
-    });
-
-    const projectsArea = containerEl.createEl("textarea", {
-      cls: "tnof-projects-textarea",
-    });
-    projectsArea.style.width = "100%";
-    projectsArea.style.minHeight = "120px";
-    projectsArea.style.fontFamily = "monospace";
-    projectsArea.style.fontSize = "12px";
-    projectsArea.value = this.plugin.settings.syncedProjects.join("\n");
-
-    projectsArea.addEventListener("blur", async () => {
-      this.plugin.settings.syncedProjects = projectsArea.value
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      await this.plugin.saveSettings();
     });
   }
 }

@@ -1,9 +1,9 @@
 {
   "id": "tasknotes-omnifocus",
   "name": "TaskNotes ⇄ OmniFocus",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minAppVersion": "1.7.2",
-  "description": "Bidirectionally sync opted-in TaskNotes tasks with OmniFocus. Desktop only.",
+  "description": "Mirror your TaskNotes project hierarchy into OmniFocus (folders/projects) and sync tasks bidirectionally. Desktop only.",
   "author": "Nelson Love",
   "isDesktopOnly": true
 }

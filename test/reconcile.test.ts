@@ -41,6 +41,7 @@ function task(o: Partial<TaskNote> = {}): TaskNote {
     priority: "none",
     tags: [],
     contexts: [],
+    projects: [],
     omnifocusUrl: null,
     inScope: true,
     ...o,
@@ -257,7 +258,7 @@ describe("sync — conflict resolution", () => {
     expect(byKind(plan, "updateOFTask")[0].fields.name).toBe("V");
     expect(byKind(plan, "updateTask")).toHaveLength(0);
     expect(plan.conflicts).toEqual([
-      { linkId: PK, field: "title", keptValue: "V", discardedValue: "O" },
+      { linkId: PK, field: "title", vaultValue: "V", ofValue: "O", resolution: "vault" },
     ]);
   });
 
@@ -267,7 +268,47 @@ describe("sync — conflict resolution", () => {
     const plan = reconcile(inp);
     expect(byKind(plan, "updateTask")[0].fields.title).toBe("O");
     expect(byKind(plan, "updateOFTask")).toHaveLength(0);
-    expect(plan.conflicts[0]).toMatchObject({ field: "title", keptValue: "O", discardedValue: "V" });
+    expect(plan.conflicts[0]).toMatchObject({ field: "title", vaultValue: "V", ofValue: "O", resolution: "of" });
+  });
+
+  it("flag-and-hold: both sides changed -> neither written, conflict held", () => {
+    const inp = converged({ t: { title: "V" }, o: { name: "O" }, s: { title: "S" } });
+    inp.config = { ...cfg, conflict: "flag-and-hold" };
+    const plan = reconcile(inp);
+    // Neither side is touched for the conflicted field.
+    expect(byKind(plan, "updateOFTask")).toHaveLength(0);
+    expect(byKind(plan, "updateTask")).toHaveLength(0);
+    expect(plan.conflicts).toEqual([
+      { linkId: PK, field: "title", vaultValue: "V", ofValue: "O", resolution: "held" },
+    ]);
+  });
+
+  it("flag-and-hold: still applies a NON-conflicting field on the same task", () => {
+    // title conflicts (both changed); due changed on the vault side only -> should still push.
+    const inp = converged({
+      t: { title: "V", due: "2026-08-01T00:00:00.000Z" },
+      o: { name: "O", dueDate: "2026-01-01T00:00:00.000Z" },
+      s: { title: "S", due: "2026-01-01T00:00:00.000Z" },
+    });
+    inp.config = { ...cfg, conflict: "flag-and-hold" };
+    const plan = reconcile(inp);
+    const ups = byKind(plan, "updateOFTask");
+    expect(ups).toHaveLength(1);
+    expect(ups[0].fields.dueDate).toBe("2026-08-01T00:00:00.000Z");
+    expect(ups[0].fields.name).toBeUndefined(); // held title not written
+    expect(plan.conflicts).toEqual([
+      { linkId: PK, field: "title", vaultValue: "V", ofValue: "O", resolution: "held" },
+    ]);
+  });
+
+  it("flag-and-hold: holds a tag conflict too", () => {
+    const inp = converged({ t: { tags: ["v"] }, o: { tags: ["o"] }, s: { tags: ["s"] } });
+    inp.config = { ...cfg, conflict: "flag-and-hold" };
+    const plan = reconcile(inp);
+    expect(byKind(plan, "updateOFTask")).toHaveLength(0);
+    expect(byKind(plan, "updateTask")).toHaveLength(0);
+    const held = plan.conflicts.find((c) => c.field === "tags");
+    expect(held?.resolution).toBe("held");
   });
 
   it("only vault changed -> OF update, no conflict", () => {

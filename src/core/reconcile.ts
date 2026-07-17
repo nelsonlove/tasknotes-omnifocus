@@ -72,8 +72,11 @@ import { parsePrimaryKey } from "./types.js";
  *     - direction "pull": if O !== V AND (ofChanged || !snap) -> write O to vault.
  *     - direction "sync":
  *         if vaultChanged && ofChanged && V !== O:
- *             conflict. config.conflict === "vault-canonical" -> write V to OF, push ConflictLog {field, kept:V, discarded:O}
- *                       config.conflict === "of-canonical"    -> write O to vault, push ConflictLog {field, kept:O, discarded:V}
+ *             conflict. Three policies (ConflictLog always has vaultValue:V, ofValue:O):
+ *               "vault-canonical" -> write V to OF,    push ConflictLog { ..., resolution: "vault" }
+ *               "of-canonical"    -> write O to vault, push ConflictLog { ..., resolution: "of"   }
+ *               "flag-and-hold"   -> write NOTHING to either side,
+ *                                    push ConflictLog { ..., resolution: "held" }
  *         else if vaultChanged && V !== O -> write V to OF
  *         else if ofChanged && O !== V   -> write O to vault
  *         else no-op
@@ -384,10 +387,13 @@ function reconcileScalarFields(
         // Conflict
         if (config.conflict === "vault-canonical") {
           writeToOF(V);
-          conflicts.push({ linkId, field, keptValue: V, discardedValue: O });
-        } else {
+          conflicts.push({ linkId, field, vaultValue: V, ofValue: O, resolution: "vault" });
+        } else if (config.conflict === "of-canonical") {
           writeToVault(O);
-          conflicts.push({ linkId, field, keptValue: O, discardedValue: V });
+          conflicts.push({ linkId, field, vaultValue: V, ofValue: O, resolution: "of" });
+        } else {
+          // flag-and-hold: write nothing to either side
+          conflicts.push({ linkId, field, vaultValue: V, ofValue: O, resolution: "held" });
         }
       } else if (vaultChanged && V !== O) {
         writeToOF(V);
@@ -429,10 +435,13 @@ function reconcileScalarFields(
       // Conflict
       if (config.conflict === "vault-canonical") {
         writeTagsToOF();
-        conflicts.push({ linkId, field: "tags", keptValue: V_tags, discardedValue: O_tags });
-      } else {
+        conflicts.push({ linkId, field: "tags", vaultValue: V_tags, ofValue: O_tags, resolution: "vault" });
+      } else if (config.conflict === "of-canonical") {
         writeTagsToVault();
-        conflicts.push({ linkId, field: "tags", keptValue: O_tags, discardedValue: V_tags });
+        conflicts.push({ linkId, field: "tags", vaultValue: V_tags, ofValue: O_tags, resolution: "of" });
+      } else {
+        // flag-and-hold: write nothing to either side
+        conflicts.push({ linkId, field: "tags", vaultValue: V_tags, ofValue: O_tags, resolution: "held" });
       }
     } else if (vaultTagsChanged && !setsEqual(V_tags, O_tags)) {
       writeTagsToOF();

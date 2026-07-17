@@ -25,6 +25,11 @@ export interface TaskNote {
   priority: TaskNotePriority;
   tags: string[];
   contexts: string[];
+  /**
+   * Raw `projects` frontmatter links (e.g. "[[Parent]]") — the task's parent project-notes.
+   * The reconcile core ignores this; the plugin's discovery uses it to build the project tree.
+   */
+  projects: string[];
   /** `omnifocus:///task/<primaryKey>` when linked, else null. */
   omnifocusUrl: string | null;
   /** Whether the task currently satisfies its binding's filter. Computed by the caller. */
@@ -92,8 +97,14 @@ export interface PriorityTagConfig {
 export interface ReconcileConfig {
   /** Opt-in tag, e.g. "omnifocus/sync". Excluded from the OmniFocus-facing tag set. */
   optInTag: string;
-  /** Conflict winner when both sides changed the same field in a `sync`. */
-  conflict: "vault-canonical" | "of-canonical";
+  /**
+   * How to resolve when both sides changed the same field in a `sync`:
+   *   - "vault-canonical": the vault value wins (default).
+   *   - "of-canonical": the OmniFocus value wins.
+   *   - "flag-and-hold": neither is written; the field is left untouched on both sides and
+   *     reported as a held conflict for manual resolution (re-flagged every sync until resolved).
+   */
+  conflict: "vault-canonical" | "of-canonical" | "flag-and-hold";
   bodyPolicy: "create-only" | "of-canonical" | "bidirectional";
   /** What to do to the OmniFocus mirror when a task leaves scope. */
   desurface: "delete" | "complete";
@@ -129,8 +140,17 @@ export type Mutation =
 export interface ConflictLog {
   linkId: string;
   field: string;
-  keptValue: unknown;
-  discardedValue: unknown;
+  /** The vault's value at conflict time. */
+  vaultValue: unknown;
+  /** The OmniFocus value at conflict time. */
+  ofValue: unknown;
+  /**
+   * How this conflict was resolved:
+   *   - "vault": the vault value was written to OmniFocus.
+   *   - "of": the OmniFocus value was written to the vault.
+   *   - "held": neither was written; the field is untouched, awaiting manual resolution.
+   */
+  resolution: "vault" | "of" | "held";
 }
 
 export interface Plan {

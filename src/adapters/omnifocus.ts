@@ -27,7 +27,10 @@ export interface RawOFTask {
 export type OFOp =
   | { op: "create"; ref: string; project: string; fields: OFWriteFields }
   | { op: "update"; primaryKey: string; fields: Partial<OFWriteFields> }
-  | { op: "delete"; primaryKey: string };
+  | { op: "delete"; primaryKey: string }
+  // "enrich" a PROJECT's own root-task fields (due/defer/flag/note/completion). primaryKey is the
+  // project's primaryKey. Completion maps to Project.Status (Done/Active); name/tags are not written.
+  | { op: "updateProject"; primaryKey: string; fields: Partial<OFWriteFields> };
 
 export interface BatchResult {
   /** create `ref` (caller correlation id, e.g. taskId) -> new primaryKey */
@@ -37,11 +40,48 @@ export interface BatchResult {
   errors: { ref?: string; primaryKey?: string; message: string }[];
 }
 
+/** One OmniFocus folder to ensure exists, identified by its FULL path (outermost-first, including its own title). */
+export interface FolderSpec {
+  path: string[];
+}
+
+/** One OmniFocus project to ensure exists, matched by name, created inside `folderPath` ([] = top level). */
+export interface ProjectSpec {
+  title: string;
+  /** Containing folder path, outermost-first; [] = top level. */
+  folderPath: string[];
+}
+
+export interface ScaffoldResult {
+  /** Full paths ("/"-joined) of folders that were newly created this run. */
+  createdFolders: string[];
+  /** Titles of projects that were newly created this run. */
+  createdProjects: string[];
+  errors: { path?: string; message: string }[];
+}
+
 export interface OmniFocusAdapter {
   /** ONE osascript spawn: returns every task in the named project, normalized. */
   readProject(project: string): Promise<OmniFocusTask[]>;
   /** ONE osascript spawn: performs ALL ops inside a single OmniJS script. */
   applyBatch(ops: OFOp[]): Promise<BatchResult>;
+  /**
+   * ONE osascript spawn: ensure every folder and project exists (create the missing ones),
+   * so tasks can reconcile into a project that is guaranteed to be present.
+   */
+  ensureStructure(folders: FolderSpec[], projects: ProjectSpec[]): Promise<ScaffoldResult>;
+  /**
+   * ONE osascript spawn: read each named project's OWN fields (its root-task due/defer/flag/note +
+   * completion) as an OmniFocusTask (primaryKey = the project's primaryKey). Missing projects are
+   * omitted from the result. Used by the enrich pass so a project-node's own fields round-trip.
+   */
+  readProjectsMeta(projectNames: string[]): Promise<Record<string, OmniFocusTask>>;
+  /**
+   * ONE osascript spawn: read specific tasks by primaryKey (via Task.byIdentifier), normalized and
+   * keyed by primaryKey. Missing tasks are omitted. Used by the de-surface pass so a task leaving
+   * scope is distinguished from a genuinely-deleted mirror (present -> delete/complete; absent -> clear).
+   */
+  readTasksByIds(primaryKeys: string[]): Promise<Record<string, OmniFocusTask>>;
 }
 
 /**
@@ -143,7 +183,12 @@ export function buildBatchScript(ops: OFOp[]): string {
     try {
       if (op.op === 'create') {
         var proj = flattenedProjects.find(function (p) { return p.name === op.project; });
-        if (!proj) { proj = new Project(op.project); }
+        if (!proj) {
+          // ensureStructure runs first and guarantees the project exists; a miss here means a
+          // scaffold/name mismatch — surface it rather than silently creating a duplicate top-level project.
+          result.errors.push({ ref: op.ref, message: 'Project not found (scaffold missing?): ' + op.project });
+          continue;
+        }
         var newTask = new Task(op.fields.name || 'Untitled', proj.ending);
         setTaskFields(newTask, op.fields);
         if (op.fields.completed) { newTask.markComplete(); }
@@ -166,6 +211,19 @@ export function buildBatchScript(ops: OFOp[]): string {
         }
         deleteObject(taskToDelete);
         result.deleted.push(op.primaryKey);
+      } else if (op.op === 'updateProject') {
+        var proj = Project.byIdentifier(op.primaryKey);
+        if (!proj) {
+          result.errors.push({ primaryKey: op.primaryKey, message: 'Project not found: ' + op.primaryKey });
+          continue;
+        }
+        if (op.fields.note !== undefined) { proj.note = op.fields.note || ''; }
+        if (op.fields.flagged !== undefined) { proj.flagged = op.fields.flagged; }
+        if (op.fields.dueDate !== undefined) { proj.dueDate = op.fields.dueDate ? new Date(op.fields.dueDate) : null; }
+        if (op.fields.deferDate !== undefined) { proj.deferDate = op.fields.deferDate ? new Date(op.fields.deferDate) : null; }
+        if (op.fields.completed === true) { proj.status = Project.Status.Done; }
+        else if (op.fields.completed === false) { proj.status = Project.Status.Active; }
+        result.updated.push(op.primaryKey);
       }
     } catch (e) {
       var errEntry = { message: String(e) };
@@ -174,6 +232,187 @@ export function buildBatchScript(ops: OFOp[]): string {
     }
   }
 
+  return JSON.stringify(result);
+})();
+`.trim();
+}
+
+/**
+ * Build the OmniJS source that ensures every folder in `folders` and every project in `projects`
+ * exists, and ends with JSON.stringify(result: ScaffoldResult). Embed the input via encodePayload.
+ *
+ * REQUIREMENTS (implement to satisfy test/omnifocus.test.ts):
+ *  - Folders are identified by their FULL path (outermost-first). Create missing folders
+ *    PARENTS-FIRST: a nested folder's parent must exist (or be created) before it. Idempotent —
+ *    a folder whose full path already exists is reused, never duplicated. Match a folder by walking
+ *    its parent chain of names (folder `.parent`) and comparing to the spec path.
+ *      OmniJS: `new Folder(name)` (top level), `new Folder(name, parentFolder)` (nested),
+ *              `flattenedFolders`, folder `.parent`, folder `.name`.
+ *  - Projects are matched BY NAME across the whole database (`flattenedProjects.find(p => p.name === title)`);
+ *    if found, reused (folder ignored — documented name-collision caveat). If missing, created inside
+ *    its `folderPath` folder (ensuring that folder path first), or at top level when folderPath is [].
+ *      OmniJS: `new Project(title, folder)` (in a folder), `new Project(title)` (top level).
+ *  - Per-item failures go into result.errors (with the offending "/"-joined path) rather than aborting
+ *    the whole scaffold. result.createdFolders / result.createdProjects list only what was NEWLY created.
+ */
+export function buildScaffoldScript(folders: FolderSpec[], projects: ProjectSpec[]): string {
+  const encoded = encodePayload({ folders, projects });
+  return `
+(function() {
+  var payload = ${encoded};
+  var folders = payload.folders;
+  var projects = payload.projects;
+  var result = { createdFolders: [], createdProjects: [], errors: [] };
+
+  function getFolderPath(folder) {
+    var chain = [];
+    var current = folder;
+    while (current) {
+      chain.unshift(current.name);
+      current = current.parent;
+    }
+    return chain;
+  }
+
+  function pathsEqual(a, b) {
+    if (a.length !== b.length) { return false; }
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) { return false; }
+    }
+    return true;
+  }
+
+  function findFolder(path) {
+    return flattenedFolders.find(function(f) {
+      return pathsEqual(getFolderPath(f), path);
+    });
+  }
+
+  function ensureFolder(path) {
+    if (path.length === 0) { return null; }
+    var existing = findFolder(path);
+    if (existing) { return existing; }
+    var name = path[path.length - 1];
+    var newFolder;
+    if (path.length === 1) {
+      newFolder = new Folder(name);
+    } else {
+      var parentPath = path.slice(0, path.length - 1);
+      var parentFolder = ensureFolder(parentPath);
+      newFolder = new Folder(name, parentFolder);
+    }
+    result.createdFolders.push(path.join('/'));
+    return newFolder;
+  }
+
+  // Sort folders by path length ascending so parents are created before children.
+  var sortedFolders = folders.slice().sort(function(a, b) {
+    return a.path.length - b.path.length;
+  });
+
+  for (var i = 0; i < sortedFolders.length; i++) {
+    var spec = sortedFolders[i];
+    try {
+      ensureFolder(spec.path);
+    } catch (e) {
+      result.errors.push({ path: spec.path.join('/'), message: String(e) });
+    }
+  }
+
+  for (var j = 0; j < projects.length; j++) {
+    var projSpec = projects[j];
+    try {
+      var existing = flattenedProjects.find(function(p) { return p.name === projSpec.title; });
+      if (existing) {
+        // Reuse — do not push to createdProjects
+      } else {
+        var newProject;
+        if (projSpec.folderPath.length === 0) {
+          newProject = new Project(projSpec.title);
+        } else {
+          var folder = ensureFolder(projSpec.folderPath);
+          newProject = new Project(projSpec.title, folder);
+        }
+        result.createdProjects.push(projSpec.title);
+      }
+    } catch (e) {
+      result.errors.push({ path: projSpec.folderPath.concat([projSpec.title]).join('/'), message: String(e) });
+    }
+  }
+
+  return JSON.stringify(result);
+})();
+`.trim();
+}
+
+/**
+ * Build the OmniJS source that reads each project's OWN fields and ends with
+ * JSON.stringify(result: Record<projectName, RawOFTask>). Embed `projectNames` via encodePayload.
+ *
+ * REQUIREMENTS (implement to satisfy test/omnifocus.test.ts):
+ *  - For each name, find the project via `flattenedProjects.find(p => p.name === name)`. Skip missing.
+ *  - Emit a RawOFTask keyed by the project NAME, where:
+ *      id = project.id.primaryKey, name = project.name, note = project.note || null,
+ *      completed = (project.status === Project.Status.Done),
+ *      due = project.dueDate ? project.dueDate.getTime() : null,
+ *      defer = project.deferDate ? project.deferDate.getTime() : null,
+ *      estimatedMinutes = null, flagged = project.flagged,
+ *      tags = project.tags ? project.tags.map(t => t.name) : []
+ *  - Pure OmniJS; end with `return JSON.stringify(result);`.
+ */
+export function buildReadProjectsMetaScript(projectNames: string[]): string {
+  const encoded = encodePayload(projectNames);
+  return `
+(function() {
+  var names = ${encoded};
+  var result = {};
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var p = flattenedProjects.find(function(proj) { return proj.name === name; });
+    if (!p) { continue; }
+    result[name] = {
+      id: p.id.primaryKey,
+      name: p.name,
+      note: p.note || null,
+      completed: (p.status === Project.Status.Done),
+      due: p.dueDate ? p.dueDate.getTime() : null,
+      defer: p.deferDate ? p.deferDate.getTime() : null,
+      estimatedMinutes: null,
+      flagged: p.flagged,
+      tags: p.tags ? p.tags.map(function(t) { return t.name; }) : []
+    };
+  }
+  return JSON.stringify(result);
+})();
+`.trim();
+}
+
+/**
+ * Build the OmniJS source that reads specific tasks by primaryKey (Task.byIdentifier) and ends with
+ * JSON.stringify(result: Record<primaryKey, RawOFTask>). Missing tasks are omitted. Embed the ids
+ * via encodePayload.
+ */
+export function buildReadTasksByIdsScript(primaryKeys: string[]): string {
+  const encoded = encodePayload(primaryKeys);
+  return `
+(function() {
+  var ids = ${encoded};
+  var result = {};
+  for (var i = 0; i < ids.length; i++) {
+    var t = Task.byIdentifier(ids[i]);
+    if (!t) { continue; }
+    result[ids[i]] = {
+      id: t.id.primaryKey,
+      name: t.name,
+      note: t.note || null,
+      completed: t.taskStatus === Task.Status.Completed,
+      due: t.dueDate ? t.dueDate.getTime() : null,
+      defer: t.deferDate ? t.deferDate.getTime() : null,
+      estimatedMinutes: (t.estimatedMinutes === null || t.estimatedMinutes === undefined) ? null : t.estimatedMinutes,
+      flagged: t.flagged,
+      tags: t.tags.map(function (x) { return x.name; })
+    };
+  }
   return JSON.stringify(result);
 })();
 `.trim();
@@ -211,6 +450,55 @@ export function createOmniFocusAdapter(run: OmniJSRunner): OmniFocusAdapter {
         throw new Error(`OmniFocus: failed to parse applyBatch output: ${output}`);
       }
       return parsed;
+    },
+
+    async ensureStructure(folders: FolderSpec[], projects: ProjectSpec[]): Promise<ScaffoldResult> {
+      if (folders.length === 0 && projects.length === 0) {
+        return { createdFolders: [], createdProjects: [], errors: [] };
+      }
+      const script = buildScaffoldScript(folders, projects);
+      const output = await run(script);
+      let parsed: ScaffoldResult;
+      try {
+        parsed = JSON.parse(output) as ScaffoldResult;
+      } catch {
+        throw new Error(`OmniFocus: failed to parse ensureStructure output: ${output}`);
+      }
+      return parsed;
+    },
+
+    async readProjectsMeta(projectNames: string[]): Promise<Record<string, OmniFocusTask>> {
+      if (projectNames.length === 0) return {};
+      const script = buildReadProjectsMetaScript(projectNames);
+      const output = await run(script);
+      let parsed: Record<string, RawOFTask>;
+      try {
+        parsed = JSON.parse(output) as Record<string, RawOFTask>;
+      } catch {
+        throw new Error(`OmniFocus: failed to parse readProjectsMeta output: ${output}`);
+      }
+      const result: Record<string, OmniFocusTask> = {};
+      for (const [name, raw] of Object.entries(parsed)) {
+        result[name] = normalizeOFTask(raw);
+      }
+      return result;
+    },
+
+    async readTasksByIds(primaryKeys: string[]): Promise<Record<string, OmniFocusTask>> {
+      if (primaryKeys.length === 0) return {};
+      const script = buildReadTasksByIdsScript(primaryKeys);
+      const output = await run(script);
+      let parsed: Record<string, RawOFTask>;
+      try {
+        parsed = JSON.parse(output) as Record<string, RawOFTask>;
+      } catch {
+        throw new Error(`OmniFocus: failed to parse readTasksByIds output: ${output}`);
+      }
+      const result: Record<string, OmniFocusTask> = {};
+      for (const [pk, raw] of Object.entries(parsed)) {
+        result[pk] = normalizeOFTask(raw);
+      }
+      return result;
     },
   };
 }
