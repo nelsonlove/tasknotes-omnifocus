@@ -17,6 +17,7 @@ import type {
   TaskNote,
   TaskWriteFields,
 } from "./types.js";
+import { composeOFNote, obsidianUri } from "./obsidian.js";
 
 export interface ProjectMetaResult {
   /** Fields to write onto the OmniFocus project (becomes an updateProject op). */
@@ -185,8 +186,10 @@ export function reconcileProjectMeta(
   }
 
   // --- NOTE (create-only, vault -> project, one-directional) ---
+  // On first enrich, set the note to the Obsidian back-link (if configured) plus the node body.
   if (snap === undefined) {
-    projectFields.note = node.body;
+    const uri = config.obsidianVault ? obsidianUri(node.id, config.obsidianVault) : null;
+    projectFields.note = composeOFNote(node.body, uri, node.description);
   }
 
   return { projectFields, vaultFields, setStatus, conflicts };

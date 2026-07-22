@@ -4,6 +4,10 @@ import type TaskNotesOmniFocusPlugin from "./main.js";
 export interface TaskNotesOmnifocusSettings {
   /** Vault tag that opts a task (or a project subtree) OUT of OmniFocus sync. */
   ignoreTag: string;
+  /** Tags never mirrored to OmniFocus (e.g. the TaskNotes marker tag "task" that everything carries). */
+  excludeTags: string[];
+  /** Depth→type map: hierarchyLevels[depth] ∈ {folder,project,task}; deeper → task. See levels.ts. */
+  hierarchyLevels: ("folder" | "project" | "task")[];
   /** Base URL for the TaskNotes API. */
   taskNotesApi: string;
   /** Conflict resolution strategy when both sides changed the same field in a sync. */
@@ -25,10 +29,16 @@ export interface TaskNotesOmnifocusSettings {
   completedStatuses: string[];
   /** Optional Bearer token for the TaskNotes API. */
   authToken?: string;
+  /** Vault folder where OmniFocus inbox tasks are captured as new TaskNotes. Blank = disabled. */
+  inboxDestination: string;
 }
 
 export const DEFAULT_SETTINGS: TaskNotesOmnifocusSettings = {
   ignoreTag: "omnifocus/ignore",
+  // The TaskNotes identifier tag is read live from TaskNotes' own settings (see main.ts buildConfig);
+  // this list is only for ADDITIONAL tags the user wants kept out of OmniFocus.
+  excludeTags: [],
+  hierarchyLevels: ["folder", "project", "task"],
   taskNotesApi: "http://localhost:8080",
   conflict: "vault-canonical",
   bodyPolicy: "create-only",
@@ -46,6 +56,7 @@ export const DEFAULT_SETTINGS: TaskNotesOmnifocusSettings = {
   doneStatus: "done",
   reopenStatus: "open",
   completedStatuses: ["done"],
+  inboxDestination: "",
 };
 
 export class SettingTab extends PluginSettingTab {
@@ -184,6 +195,21 @@ export class SettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             const trimmed = value.trim();
             this.plugin.settings.authToken = trimmed || undefined;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Inbox capture folder")
+      .setDesc(
+        "Vault folder where OmniFocus inbox tasks are captured as new TaskNotes. Blank = disabled. Only runs on pull/sync.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("(disabled)")
+          .setValue(this.plugin.settings.inboxDestination)
+          .onChange(async (value) => {
+            this.plugin.settings.inboxDestination = value.trim();
             await this.plugin.saveSettings();
           }),
       );

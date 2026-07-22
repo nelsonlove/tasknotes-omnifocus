@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   buildBatchScript,
+  buildReadInboxScript,
   buildReadProjectsMetaScript,
   buildReadScript,
   buildScaffoldScript,
@@ -23,6 +24,7 @@ const rawTask = (o: Partial<RawOFTask> = {}): RawOFTask => ({
   completed: false,
   due: null,
   defer: null,
+  planned: null,
   estimatedMinutes: null,
   flagged: false,
   tags: [],
@@ -34,6 +36,7 @@ const writeFields = (o: Partial<OFWriteFields> = {}): OFWriteFields => ({
   note: null,
   dueDate: null,
   deferDate: null,
+  plannedDate: null,
   estimatedMinutes: null,
   flagged: false,
   tags: [],
@@ -69,6 +72,7 @@ describe("normalizeOFTask", () => {
       completed: true,
       dueDate: "2026-07-20T09:00:00.000Z",
       deferDate: "2026-07-18T00:00:00.000Z",
+      plannedDate: null,
       estimatedMinutes: 30,
       flagged: true,
       tags: ["x"],
@@ -76,10 +80,16 @@ describe("normalizeOFTask", () => {
   });
 
   it("uses null (not empty string) for absent dates and note", () => {
-    const t = normalizeOFTask(rawTask({ due: null, defer: null, note: null }));
+    const t = normalizeOFTask(rawTask({ due: null, defer: null, planned: null, note: null }));
     expect(t.dueDate).toBeNull();
     expect(t.deferDate).toBeNull();
+    expect(t.plannedDate).toBeNull();
     expect(t.note).toBeNull();
+  });
+
+  it("canonicalizes the planned date into plannedDate", () => {
+    const t = normalizeOFTask(rawTask({ planned: Date.UTC(2026, 6, 18, 0, 0, 0) }));
+    expect(t.plannedDate).toBe("2026-07-18T00:00:00.000Z");
   });
 });
 
@@ -89,6 +99,19 @@ describe("buildReadScript / buildBatchScript", () => {
     // Project name is embedded via encodePayload (not naive concatenation).
     expect(script).toContain(encodePayload('Proj "X"'));
     expect(script).toContain("JSON.stringify");
+  });
+
+  it("read script emits the task plannedDate (planned field)", () => {
+    const script = buildReadScript("P");
+    expect(script).toContain("planned:");
+    expect(script).toContain("task.plannedDate");
+  });
+
+  it("batch script sets plannedDate in setTaskFields", () => {
+    const ops: OFOp[] = [{ op: "update", primaryKey: "pk1", fields: { plannedDate: "2026-07-18T09:00:00.000Z" } }];
+    const script = buildBatchScript(ops);
+    expect(script).toContain("task.plannedDate");
+    expect(script).toContain(encodePayload(ops));
   });
 
   it("batch script embeds ops via encodePayload and returns JSON", () => {
@@ -104,6 +127,23 @@ describe("buildReadScript / buildBatchScript", () => {
     expect(script).toContain(encodePayload(ops));
     expect(script).toContain("Project.byIdentifier");
     expect(script).toContain("Project.Status");
+  });
+
+  it("batch script supports nested-task creation (parentRef → action group) with a ref map", () => {
+    const ops: OFOp[] = [
+      { op: "create", ref: "parent", project: "P", sequential: false, fields: writeFields({ name:"Group" }) },
+      { op: "create", ref: "child", project: "P", parentRef: "parent", fields: writeFields({ name:"Child" }) },
+    ];
+    const script = buildBatchScript(ops);
+    expect(script).toContain(encodePayload(ops));
+    // resolves a parent task by ref and nests under it; and sets sequential for parallel groups
+    expect(script).toContain("parentRef");
+    expect(script).toContain("sequential");
+  });
+
+  it("scaffold script marks single-action-list projects via containsSingletonActions", () => {
+    const script = buildScaffoldScript([], [{ title: "P", folderPath: [], singleActionList: true }]);
+    expect(script).toContain("containsSingletonActions");
   });
 
   it("read-projects-meta script embeds names via encodePayload and returns JSON", () => {
@@ -125,6 +165,36 @@ describe("buildReadScript / buildBatchScript", () => {
     // Uses the folder/project constructors (pure OmniJS, not JXA).
     expect(script).toContain("new Folder");
     expect(script).toContain("new Project");
+  });
+});
+
+describe("buildReadInboxScript", () => {
+  it("reads the global inbox and emits the same per-task fields as the project read script", () => {
+    const script = buildReadInboxScript();
+    expect(script).toContain("inbox");
+    expect(script).toContain("JSON.stringify");
+    expect(script).toContain("planned:");
+    expect(script).toContain("task.plannedDate");
+    // Excludes dropped tasks, same as buildReadScript.
+    expect(script).toContain("Task.Status.Dropped");
+  });
+});
+
+describe("adapter.readInbox", () => {
+  it("runs the inbox read script and returns normalized tasks", async () => {
+    const run = vi.fn().mockResolvedValue(JSON.stringify([rawTask({ id: "inb1", due: "2026-07-20" })]));
+    const adapter = createOmniFocusAdapter(run);
+    const tasks = await adapter.readInbox();
+    expect(run).toHaveBeenCalledOnce();
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].primaryKey).toBe("inb1");
+    expect(tasks[0].dueDate).toBe("2026-07-20T00:00:00.000Z");
+  });
+
+  it("throws a clear error when the runner output is not valid JSON", async () => {
+    const run = vi.fn().mockResolvedValue("not json");
+    const adapter = createOmniFocusAdapter(run);
+    await expect(adapter.readInbox()).rejects.toThrow(/omnifocus/i);
   });
 });
 
