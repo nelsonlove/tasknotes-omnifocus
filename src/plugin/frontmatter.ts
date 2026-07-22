@@ -49,7 +49,7 @@ export async function readBody(app: App, path: string): Promise<string | null> {
   const f = fileFor(app, path);
   if (!f) return null;
   const raw = await app.vault.cachedRead(f);
-  const m = raw.match(/^---\n[\s\S]*?\n---\n?/);
+  const m = raw.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
   const body = (m ? raw.slice(m[0].length) : raw).trim();
   return body.length > 0 ? body : null;
 }

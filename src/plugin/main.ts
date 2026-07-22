@@ -4,7 +4,7 @@ import { deriveSnapshot, buildReconcileInput } from "./sync.js";
 import { executePlan } from "./executor.js";
 import { DEFAULT_SETTINGS, SettingTab } from "./settings.js";
 import type { TaskNotesOmnifocusSettings } from "./settings.js";
-import { filterIgnored } from "./projects.js";
+import { filterIgnored, computeDesurfaceIds } from "./projects.js";
 import {
   buildHasParentFilter,
   buildHasSubtasksFilter,
@@ -15,7 +15,7 @@ import {
 import { buildOFForest, collectFolders, collectProjects, forestToCreateOps } from "./hierarchy.js";
 import { validateHierarchyLevels, DEFAULT_HIERARCHY_LEVELS } from "./levels.js";
 import type { OFLevelType } from "./levels.js";
-import { readOmnifocusUrl, readDescription, readBody, readDeferred, readFlagged, writeOmnifocusUrl } from "./frontmatter.js";
+import { readOmnifocusUrl, readDescription, readBody, readDeferred, readFlagged, writeOmnifocusUrl, clearOmnifocusUrl } from "./frontmatter.js";
 import { RunLog } from "./runlog.js";
 import { sanitizeFilename, filterUncaptured, buildCaptureFrontmatter } from "./inbox.js";
 import { createTaskNotesAdapter } from "../adapters/tasknotes.js";
@@ -102,6 +102,32 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
     return [];
   }
 
+  /**
+   * How to make a captured note recognizable as a TaskNote. TaskNotes identifies tasks either by a
+   * marker TAG or by a frontmatter PROPERTY (name=value) — read live from its own settings (same access
+   * pattern as `taskNotesMarkerTags()`). Returns the marker tag to apply plus, when property-based, the
+   * identifying property (name+value) to ALSO set so TaskNotes recognizes the capture. If the plugin is
+   * in property mode but its property name can't be determined, `propertyModeUnresolved` is set so the
+   * caller can warn; the tag is always set as a best-effort fallback.
+   */
+  private captureIdentity(): {
+    markerTag: string;
+    identityProperty: { name: string; value: string } | null;
+    propertyModeUnresolved: boolean;
+  } {
+    const markerTag = this.taskNotesMarkerTags()[0] ?? "note/task";
+    const st = (this.app as unknown as { plugins?: { plugins?: Record<string, { settings?: Record<string, unknown> }> } })
+      .plugins?.plugins?.["tasknotes"]?.settings;
+    if (st && st["taskIdentificationMethod"] === "property") {
+      const name = typeof st["taskPropertyName"] === "string" ? (st["taskPropertyName"] as string) : "";
+      const value = typeof st["taskPropertyValue"] === "string" ? (st["taskPropertyValue"] as string) : "";
+      if (name) return { markerTag, identityProperty: { name, value }, propertyModeUnresolved: false };
+      return { markerTag, identityProperty: null, propertyModeUnresolved: true };
+    }
+    // Tag-based (or TaskNotes absent): the marker tag is the identity.
+    return { markerTag, identityProperty: null, propertyModeUnresolved: false };
+  }
+
   async runSync(direction: "push" | "pull" | "sync", { dryRun }: { dryRun: boolean }) {
     const log = new RunLog(this.app, this.manifest.dir ?? ".");
     try {
@@ -182,12 +208,109 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       log.line(`forest: ${folders.length} folders, ${projects.length} projects`);
 
       if (dryRun) {
-        const countTasks = (items: import("./hierarchy.js").OFItem[]): number =>
-          items.reduce((acc, it) => acc + 1 + countTasks(it.children), 0);
-        const taskTotal = projects.reduce((n, p) => n + countTasks(p.tasks), 0);
-        new Notice(
-          `TaskNotes⇄OmniFocus (dry run):\n${projectNodes.length} project-nodes → ${folders.length} folders, ${projects.length} projects, ${taskTotal} tasks.`,
-        );
+        // Read-only preview: reconcile each project (and the enrich pass) WITHOUT mutating anything.
+        // No applyBatch/executePlan/writeOmnifocusUrl/tasknotes.update/scaffold — every call below is a read.
+        // Work on a SCRATCH store (seeded from persisted state + the frontmatter link bridge) so this.store
+        // and data.json stay untouched.
+        const scratch = new SyncStore(this.store.toJSON());
+        // Bridge frontmatter identity → scratch links, verified against live OF (dangling stamps recreate).
+        const stampedPks = [...taskById.values()]
+          .map((t) => parsePrimaryKey(t.omnifocusUrl ?? null))
+          .filter((pk): pk is string => pk !== null);
+        const liveOf = stampedPks.length ? await omnifocus.readTasksByIds(stampedPks) : {};
+        for (const [id, t] of taskById) {
+          const pk = parsePrimaryKey(t.omnifocusUrl ?? null);
+          if (pk && liveOf[pk]) scratch.setLink(id, pk);
+        }
+        const linkedPk = (id: string) => {
+          const pk = parsePrimaryKey(taskById.get(id)?.omnifocusUrl ?? null);
+          return pk && liveOf[pk] ? pk : null;
+        };
+
+        const lines: string[] = [];
+        let creates = 0;
+        let updates = 0;
+        let deletes = 0;
+        let statuses = 0;
+        let clears = 0;
+        let conflicts = 0;
+
+        for (const proj of projects) {
+          const leafIds: string[] = [];
+          const collect = (items: import("./hierarchy.js").OFItem[]): void => {
+            for (const it of items) {
+              if (it.type === "task") leafIds.push(it.sourceId);
+              collect(it.children);
+            }
+          };
+          collect(proj.tasks);
+          // Unlinked in-scope leaves would be CREATED (new-flow: via the create pass, not reconcile).
+          const projCreates = leafIds.filter((id) => taskById.get(id) !== undefined && linkedPk(id) === null).length;
+          creates += projCreates;
+          // Linked leaves are what reconcile compares (values on existing links).
+          const members = leafIds
+            .map((id) => taskById.get(id))
+            .filter((t): t is TaskNote => t !== undefined && linkedPk(t.id) !== null);
+          let pCreates = 0, pUpdates = 0, pDeletes = 0, pStatuses = 0, pClears = 0, pConflicts = 0;
+          if (members.length > 0) {
+            const ofTasks = await omnifocus.readProject(proj.name);
+            const plan = reconcile(
+              buildReconcileInput({
+                direction,
+                inScopeTasks: members,
+                desurfaceTasks: [],
+                ofTasks,
+                store: scratch,
+                config,
+                binding: { omnifocusProject: proj.name },
+              }),
+            );
+            for (const m of plan.mutations) {
+              if (m.kind === "createOFTask") pCreates++;
+              else if (m.kind === "updateOFTask" || m.kind === "updateTask") pUpdates++;
+              else if (m.kind === "deleteOFTask") pDeletes++;
+              else if (m.kind === "setStatus") pStatuses++;
+              else if (m.kind === "clearLink") pClears++;
+            }
+            pConflicts = plan.conflicts.length;
+            updates += pUpdates;
+            deletes += pDeletes;
+            statuses += pStatuses;
+            clears += pClears;
+            conflicts += pConflicts;
+            creates += pCreates;
+          }
+          if (projCreates + pCreates + pUpdates + pDeletes + pStatuses + pClears + pConflicts > 0) {
+            lines.push(
+              `[${proj.name}] ${projCreates + pCreates} creates, ${pUpdates} updates, ${pDeletes} deletes, ${pStatuses} status changes, ${pClears} link clears, ${pConflicts} conflicts`,
+            );
+          }
+        }
+
+        // Enrich preview: project-node own-field updates back onto their OF projects.
+        const metas = await omnifocus.readProjectsMeta(projects.map((p) => p.name));
+        let enrichUpdates = 0;
+        let enrichConflicts = 0;
+        for (const proj of projects) {
+          const node = taskById.get(proj.sourceId);
+          if (!node) continue;
+          const meta = metas[proj.name];
+          if (!meta) continue;
+          const res = reconcileProjectMeta(node, meta, scratch.getSnapshot(meta.primaryKey), direction, config);
+          if (Object.keys(res.projectFields).length) enrichUpdates++;
+          enrichConflicts += res.conflicts.length;
+        }
+        conflicts += enrichConflicts;
+        if (enrichUpdates || enrichConflicts) {
+          lines.push(`[enrich] ${enrichUpdates} project-field updates, ${enrichConflicts} conflicts`);
+        }
+
+        const header = `Discovered ${projects.length} projects / ${folders.length} folders (${projectNodes.length} nodes). Would create ${creates} tasks, ${updates} updates, ${deletes} deletes, ${statuses} status changes, ${clears} link clears, ${conflicts} conflicts.`;
+        const body = lines.length ? lines.join("\n") : "No task changes.";
+        log.line(`DRY-RUN preview: ${header}`);
+        for (const l of lines) log.line(`  ${l}`);
+        await log.flush(`tasknotes-omnifocus dry-run @ ${new Date().toISOString()}`);
+        new Notice(`TaskNotes⇄OmniFocus (dry run):\n${header}\n${body}`);
         return;
       }
 
@@ -297,7 +420,7 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
             errors++;
           }
         }
-        const res = reconcileProjectMeta(node, meta, this.store.getSnapshot(pk), "push", config);
+        const res = reconcileProjectMeta(node, meta, this.store.getSnapshot(pk), direction, config);
         if (Object.keys(res.projectFields).length) projectOps.push({ op: "updateProject", primaryKey: pk, fields: res.projectFields });
         if (Object.keys(res.vaultFields).length) {
           try { await tasknotes.update(node.id, res.vaultFields); enrichVaultWrites++; } catch { errors++; }
@@ -385,7 +508,21 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         const inboxTasks = await omnifocus.readInbox();
         const toCapture = filterUncaptured(inboxTasks, capturedPks);
         log.line(`inbox: ${inboxTasks.length} in OF inbox, ${toCapture.length} uncaptured`);
-        const markerTag = this.taskNotesMarkerTags()[0] ?? "note/task";
+        const identity = this.captureIdentity();
+        if (identity.propertyModeUnresolved) {
+          log.line(
+            `[inbox-capture] WARNING: TaskNotes uses property-based identification but the identifying property name could not be determined — captured notes may not be recognized as tasks (falling back to tag "${identity.markerTag}").`,
+          );
+        }
+
+        // Ensure the destination folder exists ONCE before the loop (createFolder throws if it already does).
+        if (toCapture.length > 0) {
+          try {
+            await app.vault.createFolder(inboxDestination);
+          } catch {
+            // Folder already exists — fine.
+          }
+        }
 
         for (const task of toCapture) {
           try {
@@ -397,22 +534,18 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
               destPath = `${base} ${n}.md`;
               n++;
             }
-            // Ensure the destination folder exists (createFolder throws if it already does).
-            try {
-              await app.vault.createFolder(inboxDestination);
-            } catch {
-              // Folder already exists — fine.
-            }
             const file = await app.vault.create(destPath, "");
             await app.fileManager.processFrontMatter(file, (fm) => {
               Object.assign(
                 fm,
                 buildCaptureFrontmatter(task, {
-                  markerTag,
+                  markerTag: identity.markerTag,
                   doneStatus: this.settings.doneStatus,
-                  openStatus: "open",
+                  openStatus: this.settings.reopenStatus,
                 }),
               );
+              // Property-based TaskNotes recognition: also stamp the identifying property.
+              if (identity.identityProperty) fm[identity.identityProperty.name] = identity.identityProperty.value;
               fm.uid = crypto.randomUUID();
             });
             if (task.note) {
@@ -426,6 +559,62 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
           }
         }
         log.line(`inbox-capture: ${captured} captured`);
+      }
+
+      // --- 8. De-surface pass: tasks that ARE linked (frontmatter omnifocusUrl, bridged into the store)
+      //        but are no longer a member of ANY synced project. Their OmniFocus mirror is deleted or
+      //        completed per config.desurface, and the store link + stale frontmatter link are cleared.
+      //        Runs after the main loop (push/sync effectful; the reconcile core no-ops de-surface on pull).
+      let desurfaced = 0;
+      // allMemberIds = every in-scope task id: all leaf task ids in the forest PLUS every project-node id.
+      const allMemberIds = new Set<string>();
+      for (const proj of projects) {
+        allMemberIds.add(proj.sourceId); // the project-node's own task id
+        const collectMembers = (items: import("./hierarchy.js").OFItem[]): void => {
+          for (const it of items) {
+            if (it.type === "task") allMemberIds.add(it.sourceId);
+            collectMembers(it.children);
+          }
+        };
+        collectMembers(proj.tasks);
+      }
+      // linkedIds = ids currently linked in the store (frontmatter links bridged in + this-run creates).
+      const linkedIds = Object.keys(this.store.toJSON().links);
+      const desurfaceIds = computeDesurfaceIds(allMemberIds, linkedIds);
+      if (desurfaceIds.length) {
+        const desurfaceRaw = await Promise.all(desurfaceIds.map((id) => tasknotes.getById(id)));
+        const desurfaceTasks = desurfaceRaw
+          .filter((t): t is NonNullable<typeof t> => t !== null)
+          .map((t) => ({ ...t, inScope: false }));
+        // Read the candidates' actual OF mirrors by primaryKey so reconcile can tell a task that merely
+        // left scope (mirror present -> delete/complete) from one whose mirror is gone (absent -> clearLink).
+        const desurfacePks = desurfaceIds
+          .map((id) => this.store.getPrimaryKey(id))
+          .filter((pk): pk is string => pk !== undefined);
+        const desurfaceOf = await omnifocus.readTasksByIds(desurfacePks);
+        const plan = reconcile(
+          buildReconcileInput({
+            direction,
+            inScopeTasks: [],
+            desurfaceTasks,
+            ofTasks: Object.values(desurfaceOf),
+            store: this.store,
+            config,
+            binding: { omnifocusProject: "" },
+          }),
+        );
+        const result = await executePlan(plan, { omnifocus, tasknotes, store: this.store, project: "" });
+        errors += result.errors.length;
+        desurfaced = result.applied;
+        // New-model: the executor's clearLink only clears the STORE link. For any de-surfaced id whose
+        // link was actually cleared (delete policy, or a missing mirror), remove the stale frontmatter
+        // omnifocusUrl too. "complete" policy retains the link, so its frontmatter is (correctly) kept.
+        for (const id of desurfaceIds) {
+          if (this.store.getPrimaryKey(id) === undefined) {
+            try { await clearOmnifocusUrl(app, id); } catch { errors++; }
+          }
+        }
+        log.line(`de-surface: ${desurfaceIds.length} candidates, ${result.applied} applied, ${result.errors.length} errors`);
       }
 
       await this.saveData({ settings: this.settings, state: this.store.toJSON() });
@@ -445,7 +634,7 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
 
       const logPath = await log.flush(`tasknotes-omnifocus run @ ${new Date().toISOString()}`);
       new Notice(
-        `TaskNotes⇄OmniFocus: ${scaffold.createdFolders.length} folders, ${scaffold.createdProjects.length} projects, ${created} tasks, ${stamped} linked, ${fieldApplied} field syncs, ${captured} captured, ${errors} errors.\nLog: ${logPath}`,
+        `TaskNotes⇄OmniFocus: ${scaffold.createdFolders.length} folders, ${scaffold.createdProjects.length} projects, ${created} tasks, ${stamped} linked, ${fieldApplied} field syncs, ${captured} captured, ${desurfaced} de-surfaced, ${errors} errors.\nLog: ${logPath}`,
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

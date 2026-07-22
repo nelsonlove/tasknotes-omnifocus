@@ -29,6 +29,10 @@ describe("sanitizeFilename", () => {
     expect(sanitizeFilename('a/b\\c:d*e?f"g<h>i|j')).toBe("a b c d e f g h i j");
   });
 
+  it("replaces control characters (NUL..\\x1f) with spaces", () => {
+    expect(sanitizeFilename("a\u0000b\u001fc")).toBe("a b c");
+  });
+
   it("collapses runs of whitespace to a single space", () => {
     expect(sanitizeFilename("a   b\t\tc")).toBe("a b c");
   });
