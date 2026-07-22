@@ -18,6 +18,34 @@ import {
 } from "../src/adapters/omnifocus.js";
 import type { OFWriteFields } from "../src/core/types.js";
 
+/**
+ * Execute a generated OmniJS read script (an `(function(){…})();` IIFE returning a JSON string) as
+ * plain JS with mocked OmniFocus globals, and parse its result. Lets us assert the RUNTIME behavior of
+ * the generated source (first-match, name filter) without a live OmniFocus.
+ */
+function runOmniScript<T>(src: string, globals: Record<string, unknown>): T {
+  const keys = Object.keys(globals);
+  const fn = new Function(...keys, `return ${src}`);
+  return JSON.parse(fn(...keys.map((k) => globals[k]))) as T;
+}
+
+// A minimal OmniJS-side task object (what flattenedTasks/inbox yield inside OmniFocus).
+const omniTask = (id: string, o: Record<string, unknown> = {}) => ({
+  id: { primaryKey: id },
+  name: "n",
+  note: null,
+  taskStatus: "active",
+  dueDate: null,
+  deferDate: null,
+  plannedDate: null,
+  estimatedMinutes: null,
+  flagged: false,
+  tags: [],
+  ...o,
+});
+
+const OMNI_GLOBALS = { Task: { Status: { Dropped: "dropped", Completed: "completed" } } };
+
 const rawTask = (o: Partial<RawOFTask> = {}): RawOFTask => ({
   id: "pk1",
   name: "T",
@@ -179,6 +207,39 @@ describe("buildReadAllProjectsScript", () => {
     expect(script).toContain("task.plannedDate");
     // Excludes dropped tasks, same as buildReadScript.
     expect(script).toContain("Task.Status.Dropped");
+  });
+
+  it("keeps the FIRST project's tasks on a duplicate name (matches readProject's find, not last-wins)", () => {
+    const script = buildReadAllProjectsScript();
+    const flattenedProjects = [
+      { name: "Dup", flattenedTasks: [omniTask("first")] },
+      { name: "Dup", flattenedTasks: [omniTask("second")] },
+    ];
+    const out = runOmniScript<Record<string, RawOFTask[]>>(script, { ...OMNI_GLOBALS, flattenedProjects });
+    expect(out.Dup).toHaveLength(1);
+    expect(out.Dup[0].id).toBe("first");
+  });
+
+  it("emits ONLY the named projects when a name filter is given (leaves the rest unread)", () => {
+    const script = buildReadAllProjectsScript(["Keep"]);
+    expect(script).toContain(encodePayload(["Keep"]));
+    const flattenedProjects = [
+      { name: "Keep", flattenedTasks: [omniTask("k1")] },
+      { name: "Drop", flattenedTasks: [omniTask("d1")] },
+    ];
+    const out = runOmniScript<Record<string, RawOFTask[]>>(script, { ...OMNI_GLOBALS, flattenedProjects });
+    expect(Object.keys(out)).toEqual(["Keep"]);
+    expect(out.Keep[0].id).toBe("k1");
+  });
+
+  it("reads EVERY project when no name filter is given (no-arg behavior preserved)", () => {
+    const script = buildReadAllProjectsScript();
+    const flattenedProjects = [
+      { name: "A", flattenedTasks: [omniTask("a1")] },
+      { name: "B", flattenedTasks: [omniTask("b1")] },
+    ];
+    const out = runOmniScript<Record<string, RawOFTask[]>>(script, { ...OMNI_GLOBALS, flattenedProjects });
+    expect(Object.keys(out).sort()).toEqual(["A", "B"]);
   });
 });
 

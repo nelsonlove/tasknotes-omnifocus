@@ -105,11 +105,14 @@ import { resolveCompletion, resolveScalarField } from "./reconcileScalar.js";
  *   On create, OFWriteFields.tags = ofTagsFor(task, config), flagged = task.flagged (independent field).
  *   When priority changes and is written to OF, recompute (if enabled) the tag set. Priority no longer
  *   drives the flag — `flagged` is its own bidirectional scalar field (V=task.flagged, O=of.flagged).
- *   TAGS are PUSH-ONLY (vault -> OF): ofTagsFor merges vault contexts + tags into one flat OF tag set,
- *   so writing that back to vault `tags` would demote contexts into tags and lose the split. The vault
- *   tag set is therefore never overwritten from OmniFocus (pull/sync never write vault tags); only the
- *   push side (and the vault-canonical sync resolution) is applied. Priority is still pulled back to
- *   vault `priority` on its own (from the OF flag/tags), independent of the tag set.
+ *   TAGS are VAULT-AUTHORITATIVE (vault -> OF only): ofTagsFor merges vault contexts + tags into one
+ *   flat OF tag set, so writing that back to vault `tags` would demote contexts into tags and lose the
+ *   split. The vault tag set is therefore never overwritten from OmniFocus (pull/sync never write vault
+ *   tags). On sync, tags NEVER produce a ConflictLog: an OF-side tag edit is not a real conflict because
+ *   the vault always wins on the next push — if the vault tag set changed vs snapshot it is pushed to OF,
+ *   otherwise nothing happens. (Logging a two-sided tag change as a held/of conflict would never converge
+ *   under of-canonical, re-logging the same conflict every run.) Priority is still pulled back to vault
+ *   `priority` on its own (from the OF flag/tags), independent of the tag set.
  *
  * The core NEVER emits snapshot or stamp-link mutations; the executor owns snapshots and stamping
  * the omnifocus_url after a create. clearLink is the one link-related mutation the core emits.
@@ -386,7 +389,7 @@ function reconcileScalarFields(
     if (res.conflict) conflicts.push(res.conflict);
   }
 
-  // --- TAGS (set field, order-independent equality) — PUSH-ONLY (vault -> OmniFocus) ---
+  // --- TAGS (set field, order-independent equality) — VAULT-AUTHORITATIVE (vault -> OmniFocus) ---
   // V = ofTagsFor(task, config) — canonical vault value (contexts + tags [+ priority tag if enabled])
   // O = ofTask.tags — current OmniFocus tag set
   // S = snap?.tags ?? [] — last-synced tag set
@@ -394,14 +397,17 @@ function reconcileScalarFields(
   // Tags flow vault -> OmniFocus ONLY, never back. ofTagsFor MERGES the vault's `contexts` and `tags`
   // (plus the priority tag) into one flat OmniFocus tag set; writing that merged set back to vault
   // `tags` would demote every `context` into `tags` and permanently lose the contexts/tags split. So —
-  // like priority/flag on a project node — the vault tag set is never overwritten from OmniFocus. Only
-  // pushes (and the vault-canonical sync resolution, itself a vault->OF write) touch the OmniFocus side.
+  // like priority/flag on a project node — the vault tag set is never overwritten from OmniFocus.
+  //
+  // Because the vault always wins, an OF-side tag change is NOT a real conflict: reconcile NEVER emits a
+  // ConflictLog for tags. On sync we simply push the vault tag set to OF when it changed vs snapshot; an
+  // OF-only edit is left alone (the next vault change overwrites it). Logging a two-sided tag change as a
+  // held/of conflict would never converge — under of-canonical it re-logged the same conflict every run.
   const V_tags = ofTagsFor(task, config);
   const O_tags = ofTask.tags;
   const S_tags: string[] = snap?.tags ?? [];
 
   const vaultTagsChanged = snap ? !setsEqual(V_tags, S_tags) : true;
-  const ofTagsChanged = snap ? !setsEqual(O_tags, S_tags) : false;
 
   const writeTagsToOF = () => { ofFields.tags = ofTagsFor(task, config); };
 
@@ -410,25 +416,12 @@ function reconcileScalarFields(
       writeTagsToOF();
     }
   } else if (direction === "pull") {
-    // Push-only: vault `tags`/`contexts` are never overwritten from OmniFocus.
+    // Vault-authoritative: vault `tags`/`contexts` are never overwritten from OmniFocus.
   } else {
-    // sync — push vault tag changes to OF; never write OF tags back to the vault.
-    if (vaultTagsChanged && ofTagsChanged && !setsEqual(V_tags, O_tags)) {
-      // Both sides changed the tag set. Only vault-canonical writes (a vault->OF push); of-canonical
-      // and flag-and-hold write nothing (the vault tag set is never overwritten), but the conflict is
-      // still recorded so it surfaces for manual resolution.
-      if (config.conflict === "vault-canonical") {
-        writeTagsToOF();
-        conflicts.push({ linkId, field: "tags", vaultValue: V_tags, ofValue: O_tags, resolution: "vault" });
-      } else if (config.conflict === "of-canonical") {
-        conflicts.push({ linkId, field: "tags", vaultValue: V_tags, ofValue: O_tags, resolution: "of" });
-      } else {
-        // flag-and-hold: write nothing to either side
-        conflicts.push({ linkId, field: "tags", vaultValue: V_tags, ofValue: O_tags, resolution: "held" });
-      }
-    } else if (vaultTagsChanged && !setsEqual(V_tags, O_tags)) {
+    // sync — tags are vault-authoritative: push the vault tag set to OF if it changed vs snapshot;
+    // never write the vault and never log a conflict (an OF-side edit is not a real conflict).
+    if (vaultTagsChanged && !setsEqual(V_tags, O_tags)) {
       writeTagsToOF();
     }
-    // ofTagsChanged-only: no vault write (tags are push-only).
   }
 }
