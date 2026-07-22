@@ -331,14 +331,28 @@ describe("sync — conflict resolution", () => {
     ]);
   });
 
-  it("flag-and-hold: holds a tag conflict too", () => {
+  it("flag-and-hold: a two-sided tag change is NOT held — tags are vault-authoritative (push vault→OF, no conflict, no vault write)", () => {
     const inp = converged({ t: { tags: ["v"] }, o: { tags: ["o"] }, s: { tags: ["s"] } });
     inp.config = { ...cfg, conflict: "flag-and-hold" };
     const plan = reconcile(inp);
-    expect(byKind(plan, "updateOFTask")).toHaveLength(0);
+    const ups = byKind(plan, "updateOFTask");
+    expect(ups).toHaveLength(1);
+    expect(sortedTags(ups[0].fields.tags)).toEqual(["v"]);
     expect(byKind(plan, "updateTask")).toHaveLength(0);
-    const held = plan.conflicts.find((c) => c.field === "tags");
-    expect(held?.resolution).toBe("held");
+    expect(plan.conflicts.some((c) => c.field === "tags")).toBe(false);
+  });
+
+  it("of-canonical: a two-sided tag change still pushes vault→OF (vault-authoritative), no conflict, no vault write", () => {
+    // Regression: of-canonical previously logged a tags conflict every run while writing nothing to the
+    // vault, so under of-canonical it never converged. Tags are vault-authoritative — vault wins, no log.
+    const inp = converged({ t: { tags: ["v"] }, o: { tags: ["o"] }, s: { tags: ["s"] } });
+    inp.config = { ...cfg, conflict: "of-canonical" };
+    const plan = reconcile(inp);
+    const ups = byKind(plan, "updateOFTask");
+    expect(ups).toHaveLength(1);
+    expect(sortedTags(ups[0].fields.tags)).toEqual(["v"]);
+    expect(byKind(plan, "updateTask")).toHaveLength(0);
+    expect(plan.conflicts.some((c) => c.field === "tags")).toBe(false);
   });
 
   it("only vault changed -> OF update, no conflict", () => {
@@ -442,20 +456,31 @@ describe("tags (first-class)", () => {
     expect(byKind(reconcile(inp), "updateOFTask")).toHaveLength(0);
   });
 
-  it("pull: writes an OF tag change back to the vault (minus priority tags)", () => {
+  it("pull: does NOT write OF tag changes back to the vault (tags are push-only)", () => {
+    // ofTagsFor merges vault contexts+tags into one OF set; pulling that back would demote contexts
+    // into tags and lose the split, so the vault tag set is never overwritten from OmniFocus.
     const inp = converged({ t: { tags: ["x"] }, o: { tags: ["x", "y"] }, s: { tags: ["x"] } });
     inp.direction = "pull";
     const ups = byKind(reconcile(inp), "updateTask");
-    expect(ups).toHaveLength(1);
-    expect(sortedTags(ups[0].fields.tags)).toEqual(["x", "y"]);
+    // No vault write at all — the OF-side tag addition does not flow back.
+    expect(ups).toHaveLength(0);
   });
 
-  it("sync: a tag conflict resolves vault-canonical and logs a 'tags' conflict", () => {
+  it("sync: an OF-only tag change is NOT written back to the vault (push-only)", () => {
+    const inp = converged({ t: { tags: ["x"] }, o: { tags: ["x", "y"] }, s: { tags: ["x"] } });
+    const plan = reconcile(inp);
+    // Only OF changed -> nothing to push to OF, and tags never flow OF -> vault.
+    expect(byKind(plan, "updateOFTask")).toHaveLength(0);
+    expect(byKind(plan, "updateTask")).toHaveLength(0);
+    expect(plan.conflicts).toHaveLength(0);
+  });
+
+  it("sync: a two-sided tag change pushes vault→OF (vault-authoritative), never logs a conflict", () => {
     const inp = converged({ t: { tags: ["v"] }, o: { tags: ["o"] }, s: { tags: ["s"] } });
     const plan = reconcile(inp);
     expect(sortedTags(byKind(plan, "updateOFTask")[0].fields.tags)).toEqual(["v"]);
     expect(byKind(plan, "updateTask")).toHaveLength(0);
-    expect(plan.conflicts.some((c) => c.field === "tags")).toBe(true);
+    expect(plan.conflicts.some((c) => c.field === "tags")).toBe(false);
   });
 
   it("emits nothing when non-empty tag sets already match (order-independent)", () => {

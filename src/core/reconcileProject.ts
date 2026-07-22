@@ -18,6 +18,7 @@ import type {
   TaskWriteFields,
 } from "./types.js";
 import { composeOFNote, obsidianUri } from "./obsidian.js";
+import { resolveCompletion, resolveScalarField } from "./reconcileScalar.js";
 
 export interface ProjectMetaResult {
   /** Fields to write onto the OmniFocus project (becomes an updateProject op). */
@@ -85,25 +86,7 @@ export function reconcileProjectMeta(
   const ofDone = ofMeta.completed;
   const snapDone = snap?.isCompleted ?? false;
 
-  let target: boolean;
-  if (direction === "push") {
-    target = vaultDone;
-  } else if (direction === "pull") {
-    target = ofDone;
-  } else {
-    // sync
-    const vc = vaultDone !== snapDone;
-    const oc = ofDone !== snapDone;
-    if (vc && oc) {
-      target = vaultDone || ofDone;
-    } else if (vc) {
-      target = vaultDone;
-    } else if (oc) {
-      target = ofDone;
-    } else {
-      target = vaultDone;
-    }
-  }
+  const target = resolveCompletion(vaultDone, ofDone, snapDone, direction);
 
   if (ofMeta.completed !== target) {
     projectFields.completed = target;
@@ -142,36 +125,12 @@ export function reconcileProjectMeta(
   ];
 
   for (const { field, V, O, S, writeToProject, writeToVault } of fieldDefs) {
-    const vaultChanged = snap ? V !== S : true;
-    const ofChanged = snap ? O !== S : false;
-
-    if (direction === "push") {
-      if (V !== O) {
-        writeToProject(V);
-      }
-    } else if (direction === "pull") {
-      if (O !== V && (ofChanged || !snap)) {
-        writeToVault(O);
-      }
-    } else {
-      // sync
-      if (vaultChanged && ofChanged && V !== O) {
-        if (config.conflict === "vault-canonical") {
-          writeToProject(V);
-          conflicts.push({ linkId: ofMeta.primaryKey, field, vaultValue: V, ofValue: O, resolution: "vault" });
-        } else if (config.conflict === "of-canonical") {
-          writeToVault(O);
-          conflicts.push({ linkId: ofMeta.primaryKey, field, vaultValue: V, ofValue: O, resolution: "of" });
-        } else {
-          // flag-and-hold: write neither
-          conflicts.push({ linkId: ofMeta.primaryKey, field, vaultValue: V, ofValue: O, resolution: "held" });
-        }
-      } else if (vaultChanged && V !== O) {
-        writeToProject(V);
-      } else if (ofChanged && O !== V) {
-        writeToVault(O);
-      }
-    }
+    const res = resolveScalarField({
+      V, O, S, hasSnap: !!snap, direction, config, field, linkId: ofMeta.primaryKey,
+    });
+    if ("writeProject" in res) writeToProject(res.writeProject);
+    if ("writeVault" in res) writeToVault(res.writeVault);
+    if (res.conflict) conflicts.push(res.conflict);
   }
 
   // --- PRIORITY / FLAG (vault-authoritative, push-only) ---

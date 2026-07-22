@@ -72,6 +72,15 @@ export interface OmniFocusAdapter {
   /** ONE osascript spawn: returns every task in the named project, normalized. */
   readProject(project: string): Promise<OmniFocusTask[]>;
   /**
+   * ONE osascript spawn: returns projects' tasks, normalized, keyed by project NAME. Replaces the
+   * per-project readProject fan-out on a full sync (one spawn instead of ~one per project). A name
+   * collision (two projects sharing a name) keeps the FIRST one, consistent with readProject's
+   * first-match `flattenedProjects.find`. Pass `projectNames` to restrict the read to the in-scope
+   * projects (a large vault isn't fully read when few projects matter); omit it to read every project.
+   * Callers look up `result[projectName] ?? []`.
+   */
+  readAllProjects(projectNames?: string[]): Promise<Record<string, OmniFocusTask[]>>;
+  /**
    * ONE osascript spawn: returns every top-level OmniFocus INBOX task (tasks with no containing
    * project), normalized. Used by the inbox-capture pass to pull OF-native captures into the vault.
    */
@@ -126,6 +135,28 @@ export function normalizeOFTask(raw: RawOFTask): OmniFocusTask {
 }
 
 /**
+ * Shared OmniJS per-task projection: maps ONE task to the RawOFTask shape (nested-tag "/"-join,
+ * completed/date logic). Referenced by buildReadScript / buildReadInboxScript /
+ * buildReadAllProjectsScript so a field change lands in exactly one place and all three stay
+ * byte-identical in the task shape they emit. Written as a `function (task) {...}` expression so it
+ * can be dropped straight into a `.map(...)`.
+ */
+const TASK_PROJECTION_JS = `function (task) {
+      return {
+        id: task.id.primaryKey,
+        name: task.name,
+        note: task.note || null,
+        completed: task.taskStatus === Task.Status.Completed,
+        due: task.dueDate ? task.dueDate.getTime() : null,
+        defer: task.deferDate ? task.deferDate.getTime() : null,
+        planned: task.plannedDate ? task.plannedDate.getTime() : null,
+        estimatedMinutes: (task.estimatedMinutes === null || task.estimatedMinutes === undefined) ? null : task.estimatedMinutes,
+        flagged: task.flagged,
+        tags: task.tags.map(function (t) { var p=[]; var c=t; while(c){ p.unshift(c.name); c=c.parent; } return p.join('/'); })
+      };
+    }`;
+
+/**
  * Build the OmniJS source that reads all tasks of `project` and ends with JSON.stringify(result),
  * result being RawOFTask[]. Embed the project name via encodePayload. If the project is missing,
  * the script should return "[]" (empty array), not error.
@@ -140,20 +171,45 @@ export function buildReadScript(project: string): string {
   if (!proj) { return JSON.stringify([]); }
   var result = proj.flattenedTasks
     .filter(function (task) { return task.taskStatus !== Task.Status.Dropped; })
-    .map(function (task) {
-      return {
-        id: task.id.primaryKey,
-        name: task.name,
-        note: task.note || null,
-        completed: task.taskStatus === Task.Status.Completed,
-        due: task.dueDate ? task.dueDate.getTime() : null,
-        defer: task.deferDate ? task.deferDate.getTime() : null,
-        planned: task.plannedDate ? task.plannedDate.getTime() : null,
-        estimatedMinutes: (task.estimatedMinutes === null || task.estimatedMinutes === undefined) ? null : task.estimatedMinutes,
-        flagged: task.flagged,
-        tags: task.tags.map(function (t) { var p=[]; var c=t; while(c){ p.unshift(c.name); c=c.parent; } return p.join('/'); })
-      };
-    });
+    .map(${TASK_PROJECTION_JS});
+  return JSON.stringify(result);
+})();
+`.trim();
+}
+
+/**
+ * Build the OmniJS source that reads EVERY project's tasks in ONE spawn and ends with
+ * JSON.stringify(result), result being Record<projectName, RawOFTask[]>. Iterates `flattenedProjects`
+ * and, for each, maps its `flattenedTasks` to the SAME RawOFTask shape buildReadScript emits (same
+ * fields, same dropped-filter, same nested-tag join), keyed by the project name.
+ *
+ * A name collision keeps the FIRST project seen (a `seen` guard), matching readProject/buildReadScript
+ * which use `flattenedProjects.find` (first-match); keying by name without the guard would silently let
+ * the LAST duplicate win, disagreeing with the rest of the code.
+ *
+ * When `projectNames` is provided, ONLY projects whose name is in that set are emitted (the names are
+ * embedded via encodePayload); callers pass the in-scope project names so a large vault isn't fully
+ * read when only a few projects matter. Omit the arg (or pass []) to read every project.
+ */
+export function buildReadAllProjectsScript(projectNames?: string[]): string {
+  const encodedNames = encodePayload(projectNames ?? []);
+  return `
+(function() {
+  var wanted = ${encodedNames};
+  var filterByName = wanted.length > 0;
+  var wantedSet = {};
+  for (var i = 0; i < wanted.length; i++) { wantedSet[wanted[i]] = true; }
+  var result = {};
+  var seen = {};
+  flattenedProjects.forEach(function (proj) {
+    if (filterByName && wantedSet[proj.name] !== true) { return; }
+    // First-match on duplicate names (consistent with flattenedProjects.find elsewhere).
+    if (seen[proj.name] === true) { return; }
+    seen[proj.name] = true;
+    result[proj.name] = proj.flattenedTasks
+      .filter(function (task) { return task.taskStatus !== Task.Status.Dropped; })
+      .map(${TASK_PROJECTION_JS});
+  });
   return JSON.stringify(result);
 })();
 `.trim();
@@ -171,20 +227,7 @@ export function buildReadInboxScript(): string {
 (function() {
   var result = inbox
     .filter(function (task) { return task.taskStatus !== Task.Status.Dropped; })
-    .map(function (task) {
-      return {
-        id: task.id.primaryKey,
-        name: task.name,
-        note: task.note || null,
-        completed: task.taskStatus === Task.Status.Completed,
-        due: task.dueDate ? task.dueDate.getTime() : null,
-        defer: task.deferDate ? task.deferDate.getTime() : null,
-        planned: task.plannedDate ? task.plannedDate.getTime() : null,
-        estimatedMinutes: (task.estimatedMinutes === null || task.estimatedMinutes === undefined) ? null : task.estimatedMinutes,
-        flagged: task.flagged,
-        tags: task.tags.map(function (t) { var p=[]; var c=t; while(c){ p.unshift(c.name); c=c.parent; } return p.join('/'); })
-      };
-    });
+    .map(${TASK_PROJECTION_JS});
   return JSON.stringify(result);
 })();
 `.trim();
@@ -523,6 +566,22 @@ export function createOmniFocusAdapter(run: OmniJSRunner): OmniFocusAdapter {
         throw new Error(`OmniFocus: failed to parse readProject output: ${output}`);
       }
       return parsed.map(normalizeOFTask);
+    },
+
+    async readAllProjects(projectNames?: string[]): Promise<Record<string, OmniFocusTask[]>> {
+      const script = buildReadAllProjectsScript(projectNames);
+      const output = await run(script);
+      let parsed: Record<string, RawOFTask[]>;
+      try {
+        parsed = JSON.parse(output) as Record<string, RawOFTask[]>;
+      } catch {
+        throw new Error(`OmniFocus: failed to parse readAllProjects output: ${output}`);
+      }
+      const result: Record<string, OmniFocusTask[]> = {};
+      for (const [name, tasks] of Object.entries(parsed)) {
+        result[name] = tasks.map(normalizeOFTask);
+      }
+      return result;
     },
 
     async readInbox(): Promise<OmniFocusTask[]> {

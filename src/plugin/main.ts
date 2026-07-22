@@ -235,6 +235,9 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         let clears = 0;
         let conflicts = 0;
 
+        // ONE read of the in-scope projects' tasks (instead of a readProject spawn per project below).
+        const allProjects = await omnifocus.readAllProjects(projects.map((p) => p.name));
+
         for (const proj of projects) {
           const leafIds: string[] = [];
           const collect = (items: import("./hierarchy.js").OFItem[]): void => {
@@ -253,7 +256,7 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
             .filter((t): t is TaskNote => t !== undefined && linkedPk(t.id) !== null);
           let pCreates = 0, pUpdates = 0, pDeletes = 0, pStatuses = 0, pClears = 0, pConflicts = 0;
           if (members.length > 0) {
-            const ofTasks = await omnifocus.readProject(proj.name);
+            const ofTasks = allProjects[proj.name] ?? [];
             const plan = reconcile(
               buildReconcileInput({
                 direction,
@@ -448,6 +451,11 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       //        OmniFocus-side edit flows back to the vault and a vault edit pushes to OmniFocus.
       let fieldApplied = 0;
       let fieldConflicts = 0;
+      // ONE read of the in-scope projects' tasks up front (instead of a readProject spawn per project).
+      // The leaves reconciled here (non-created linked tasks) aren't mutated by the create/enrich passes
+      // above, so this pre-read is current for them; the post-executePlan re-snapshot below still does
+      // a targeted readProject for the (rare) projects that actually changed.
+      const allProjects = await omnifocus.readAllProjects(projects.map((p) => p.name));
       for (const proj of projects) {
         const memberIds: string[] = [];
         const collect = (items: import("./hierarchy.js").OFItem[]): void => {
@@ -463,7 +471,7 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
           // so there is nothing to reconcile (and it avoids a per-project readProject on a fresh push).
           .filter((t): t is TaskNote => t !== undefined && linkedPk(t.id) !== null && !createdIds.has(t.id));
         if (members.length === 0) continue;
-        const ofTasks = await omnifocus.readProject(proj.name);
+        const ofTasks = allProjects[proj.name] ?? [];
         const plan = reconcile(
           buildReconcileInput({
             direction,
@@ -582,7 +590,17 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       const linkedIds = Object.keys(this.store.toJSON().links);
       const desurfaceIds = computeDesurfaceIds(allMemberIds, linkedIds);
       if (desurfaceIds.length) {
-        const desurfaceRaw = await Promise.all(desurfaceIds.map((id) => tasknotes.getById(id)));
+        // getById throws on a non-404 (e.g. a transient 500). Catch per-candidate so one bad fetch
+        // yields null (that candidate is skipped this run) instead of rejecting Promise.all and aborting
+        // the whole sync in the FATAL catch — which would discard this run's snapshots (saveData never runs).
+        const desurfaceRaw = await Promise.all(
+          desurfaceIds.map((id) =>
+            tasknotes.getById(id).catch((e) => {
+              log.line(`de-surface: getById(${id}) failed, skipping: ${e instanceof Error ? e.message : String(e)}`);
+              return null;
+            }),
+          ),
+        );
         const desurfaceTasks = desurfaceRaw
           .filter((t): t is NonNullable<typeof t> => t !== null)
           .map((t) => ({ ...t, inScope: false }));

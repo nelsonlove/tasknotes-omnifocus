@@ -181,9 +181,23 @@ describe("adapter.update / setStatus", () => {
 });
 
 describe("adapter.getById", () => {
-  it("returns null when the task is not found", async () => {
+  it("returns null on a genuine 404 (task not found)", async () => {
     const fetch = fakeFetch({ success: false, error: "not found" }, false, 404);
     const adapter = createTaskNotesAdapter({ baseUrl: "http://localhost:8080", fetch, completedStatuses: COMPLETED });
     expect(await adapter.getById("missing.md")).toBeNull();
+  });
+
+  it("throws (not null) on a non-404 error like HTTP 500", async () => {
+    const fetch = fakeFetch({}, false, 500);
+    const adapter = createTaskNotesAdapter({ baseUrl: "http://localhost:8080", fetch, completedStatuses: COMPLETED });
+    await expect(adapter.getById("boom.md")).rejects.toThrow(/500.*boom\.md|boom\.md.*500/);
+  });
+
+  it("returns the normalized task when found", async () => {
+    const fetch = fakeFetch({ success: true, data: rawTN({ id: "found.md", title: "Found" }) });
+    const adapter = createTaskNotesAdapter({ baseUrl: "http://localhost:8080", fetch, completedStatuses: COMPLETED });
+    const t = await adapter.getById("found.md");
+    expect(t?.id).toBe("found.md");
+    expect(t?.title).toBe("Found");
   });
 });
