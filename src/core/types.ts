@@ -18,11 +18,15 @@ export interface TaskNote {
   status: string;
   /** ISO datetime or null. */
   due: string | null;
-  /** ISO datetime or null (maps to OmniFocus defer date). */
+  /** ISO datetime or null (maps to OmniFocus planned date). */
   scheduled: string | null;
+  /** ISO datetime or null (maps to OmniFocus defer date). TaskNotes userField. */
+  deferred: string | null;
   /** Minutes, or null. */
   timeEstimate: number | null;
   priority: TaskNotePriority;
+  /** Whether the task is flagged. Maps to the OmniFocus flag. TaskNotes userField. */
+  flagged: boolean;
   tags: string[];
   contexts: string[];
   /**
@@ -30,6 +34,11 @@ export interface TaskNote {
    * The reconcile core ignores this; the plugin's discovery uses it to build the project tree.
    */
   projects: string[];
+  /**
+   * Frontmatter `description` (one-line summary), or null. Not exposed by the TaskNotes API — the
+   * plugin populates it from the metadata cache. Push-only: written into the OmniFocus note.
+   */
+  description?: string | null;
   /** `omnifocus:///task/<primaryKey>` when linked, else null. */
   omnifocusUrl: string | null;
   /** Whether the task currently satisfies its binding's filter. Computed by the caller. */
@@ -46,6 +55,8 @@ export interface OmniFocusTask {
   dueDate: string | null;
   /** ISO datetime or null. */
   deferDate: string | null;
+  /** ISO datetime or null. */
+  plannedDate: string | null;
   estimatedMinutes: number | null;
   flagged: boolean;
   tags: string[];
@@ -57,6 +68,7 @@ export interface OFWriteFields {
   note: string | null;
   dueDate: string | null;
   deferDate: string | null;
+  plannedDate: string | null;
   estimatedMinutes: number | null;
   flagged: boolean;
   tags: string[];
@@ -68,8 +80,10 @@ export interface TaskWriteFields {
   title: string;
   due: string | null;
   scheduled: string | null;
+  deferred: string | null;
   timeEstimate: number | null;
   priority: TaskNotePriority;
+  flagged: boolean;
   tags: string[];
 }
 
@@ -81,6 +95,7 @@ export interface Snapshot {
   isCompleted: boolean;
   due: string | null;
   scheduled: string | null;
+  deferred: string | null;
   timeEstimate: number | null;
   priority: TaskNotePriority;
   flagged: boolean;
@@ -98,6 +113,11 @@ export interface ReconcileConfig {
   /** Opt-in tag, e.g. "omnifocus/sync". Excluded from the OmniFocus-facing tag set. */
   optInTag: string;
   /**
+   * Tags never pushed to OmniFocus (in addition to optInTag) — e.g. the TaskNotes marker tag "task"
+   * that every task carries, which would otherwise tag every OmniFocus item. Case-sensitive exact match.
+   */
+  excludeTags?: string[];
+  /**
    * How to resolve when both sides changed the same field in a `sync`:
    *   - "vault-canonical": the vault value wins (default).
    *   - "of-canonical": the OmniFocus value wins.
@@ -113,6 +133,11 @@ export interface ReconcileConfig {
   doneStatus: string;
   /** Status value written when reopening a completed TaskNote, e.g. "open". */
   reopenStatus: string;
+  /**
+   * Obsidian vault name for the back-link written into the OmniFocus note (an `obsidian://open` URI).
+   * null/undefined disables the back-link. Set by the plugin from `app.vault.getName()`.
+   */
+  obsidianVault?: string | null;
 }
 
 export interface ReconcileInput {

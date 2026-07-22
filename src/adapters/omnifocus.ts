@@ -18,6 +18,8 @@ export interface RawOFTask {
   due: string | number | null;
   /** epoch ms or ISO string or null */
   defer: string | number | null;
+  /** epoch ms or ISO string or null */
+  planned: string | number | null;
   estimatedMinutes: number | null;
   flagged: boolean;
   tags: string[];
@@ -25,7 +27,11 @@ export interface RawOFTask {
 
 /** One OmniFocus-side mutation, translated from the reconcile Plan by the executor. */
 export type OFOp =
-  | { op: "create"; ref: string; project: string; fields: OFWriteFields }
+  // Create a task. Placement, in priority order: `parentRef` → under the parent task created earlier
+  // THIS batch (action group); `parentPrimaryKey` → under an EXISTING OF task by id (a new child of an
+  // already-synced parent); else directly in `project`. `sequential: false` marks the created task a
+  // parallel action group (set when it will have children). Batches ordered parents-before-children.
+  | { op: "create"; ref: string; project: string; parentRef?: string; parentPrimaryKey?: string; sequential?: boolean; fields: OFWriteFields }
   | { op: "update"; primaryKey: string; fields: Partial<OFWriteFields> }
   | { op: "delete"; primaryKey: string }
   // "enrich" a PROJECT's own root-task fields (due/defer/flag/note/completion). primaryKey is the
@@ -50,6 +56,8 @@ export interface ProjectSpec {
   title: string;
   /** Containing folder path, outermost-first; [] = top level. */
   folderPath: string[];
+  /** When true, mark the project a single-action list (`containsSingletonActions = true`). Idempotent. */
+  singleActionList?: boolean;
 }
 
 export interface ScaffoldResult {
@@ -63,6 +71,11 @@ export interface ScaffoldResult {
 export interface OmniFocusAdapter {
   /** ONE osascript spawn: returns every task in the named project, normalized. */
   readProject(project: string): Promise<OmniFocusTask[]>;
+  /**
+   * ONE osascript spawn: returns every top-level OmniFocus INBOX task (tasks with no containing
+   * project), normalized. Used by the inbox-capture pass to pull OF-native captures into the vault.
+   */
+  readInbox(): Promise<OmniFocusTask[]>;
   /** ONE osascript spawn: performs ALL ops inside a single OmniJS script. */
   applyBatch(ops: OFOp[]): Promise<BatchResult>;
   /**
@@ -105,6 +118,7 @@ export function normalizeOFTask(raw: RawOFTask): OmniFocusTask {
     completed: raw.completed,
     dueDate: canonicalDate(raw.due ?? null),
     deferDate: canonicalDate(raw.defer ?? null),
+    plannedDate: canonicalDate(raw.planned ?? null),
     estimatedMinutes: raw.estimatedMinutes ?? null,
     flagged: raw.flagged,
     tags: raw.tags ?? [],
@@ -134,9 +148,41 @@ export function buildReadScript(project: string): string {
         completed: task.taskStatus === Task.Status.Completed,
         due: task.dueDate ? task.dueDate.getTime() : null,
         defer: task.deferDate ? task.deferDate.getTime() : null,
+        planned: task.plannedDate ? task.plannedDate.getTime() : null,
         estimatedMinutes: (task.estimatedMinutes === null || task.estimatedMinutes === undefined) ? null : task.estimatedMinutes,
         flagged: task.flagged,
-        tags: task.tags.map(function (t) { return t.name; })
+        tags: task.tags.map(function (t) { var p=[]; var c=t; while(c){ p.unshift(c.name); c=c.parent; } return p.join('/'); })
+      };
+    });
+  return JSON.stringify(result);
+})();
+`.trim();
+}
+
+/**
+ * Build the OmniJS source that reads the global `inbox` (top-level OmniFocus inbox tasks — tasks
+ * with no containing project) and ends with JSON.stringify(result), result being RawOFTask[]. Maps
+ * each task exactly like buildReadScript maps a project's tasks (same fields, same nested-tag join).
+ */
+export function buildReadInboxScript(): string {
+  // Pure OmniJS (runs inside OmniFocus via evaluateJavascript): the global `inbox` is the array of
+  // top-level inbox tasks. Mirror buildReadScript's per-task mapping exactly.
+  return `
+(function() {
+  var result = inbox
+    .filter(function (task) { return task.taskStatus !== Task.Status.Dropped; })
+    .map(function (task) {
+      return {
+        id: task.id.primaryKey,
+        name: task.name,
+        note: task.note || null,
+        completed: task.taskStatus === Task.Status.Completed,
+        due: task.dueDate ? task.dueDate.getTime() : null,
+        defer: task.deferDate ? task.deferDate.getTime() : null,
+        planned: task.plannedDate ? task.plannedDate.getTime() : null,
+        estimatedMinutes: (task.estimatedMinutes === null || task.estimatedMinutes === undefined) ? null : task.estimatedMinutes,
+        flagged: task.flagged,
+        tags: task.tags.map(function (t) { var p=[]; var c=t; while(c){ p.unshift(c.name); c=c.parent; } return p.join('/'); })
       };
     });
   return JSON.stringify(result);
@@ -157,10 +203,27 @@ export function buildBatchScript(ops: OFOp[]): string {
 (function() {
   var ops = ${encodedOps};
   var result = { created: {}, updated: [], deleted: [], errors: [] };
+  // ref -> the Task created this batch, so a later create with parentRef nests under it (action group).
+  var refMap = {};
 
+  // A "/"-separated tag name maps to a NESTED OmniFocus tag hierarchy: "github/sync" -> a "sync" tag
+  // under a "github" tag. Walk/create each segment, reusing existing tags at each level; return the leaf.
   function findOrCreateTag(name) {
-    var t = flattenedTags.find(function (x) { return x.name === name; });
-    return t ? t : new Tag(name);
+    var parts = name.split('/');
+    var parent = null;
+    for (var i = 0; i < parts.length; i++) {
+      var seg = parts[i];
+      if (seg === '') { continue; }
+      var found = null;
+      if (parent) {
+        found = parent.tagNamed(seg);
+      } else {
+        for (var j = 0; j < tags.length; j++) { if (tags[j].name === seg) { found = tags[j]; break; } }
+      }
+      if (!found) { found = parent ? new Tag(seg, parent) : new Tag(seg); }
+      parent = found;
+    }
+    return parent;
   }
 
   function setTaskFields(task, fields) {
@@ -172,6 +235,7 @@ export function buildBatchScript(ops: OFOp[]): string {
     }
     if (fields.dueDate !== undefined) { task.dueDate = fields.dueDate ? new Date(fields.dueDate) : null; }
     if (fields.deferDate !== undefined) { task.deferDate = fields.deferDate ? new Date(fields.deferDate) : null; }
+    if (fields.plannedDate !== undefined) { task.plannedDate = fields.plannedDate ? new Date(fields.plannedDate) : null; }
     if (fields.tags !== undefined && fields.tags !== null) {
       task.clearTags();
       fields.tags.forEach(function (n) { task.addTag(findOrCreateTag(n)); });
@@ -182,16 +246,38 @@ export function buildBatchScript(ops: OFOp[]): string {
     var op = ops[i];
     try {
       if (op.op === 'create') {
-        var proj = flattenedProjects.find(function (p) { return p.name === op.project; });
-        if (!proj) {
-          // ensureStructure runs first and guarantees the project exists; a miss here means a
-          // scaffold/name mismatch — surface it rather than silently creating a duplicate top-level project.
-          result.errors.push({ ref: op.ref, message: 'Project not found (scaffold missing?): ' + op.project });
-          continue;
+        var newTask;
+        if (op.parentRef) {
+          // Nested task (action group): create UNDER the parent task created earlier this batch.
+          var parentTask = refMap[op.parentRef];
+          if (!parentTask) {
+            result.errors.push({ ref: op.ref, message: 'Parent ref not found in batch: ' + op.parentRef });
+            continue;
+          }
+          newTask = new Task(op.fields.name || 'Untitled', parentTask.ending);
+        } else if (op.parentPrimaryKey) {
+          // New child of an already-synced parent task (found by id).
+          var existingParent = Task.byIdentifier(op.parentPrimaryKey);
+          if (!existingParent) {
+            result.errors.push({ ref: op.ref, message: 'Parent task not found: ' + op.parentPrimaryKey });
+            continue;
+          }
+          newTask = new Task(op.fields.name || 'Untitled', existingParent.ending);
+        } else {
+          var proj = flattenedProjects.find(function (p) { return p.name === op.project; });
+          if (!proj) {
+            // ensureStructure runs first and guarantees the project exists; a miss here means a
+            // scaffold/name mismatch — surface it rather than silently creating a duplicate top-level project.
+            result.errors.push({ ref: op.ref, message: 'Project not found (scaffold missing?): ' + op.project });
+            continue;
+          }
+          newTask = new Task(op.fields.name || 'Untitled', proj.ending);
         }
-        var newTask = new Task(op.fields.name || 'Untitled', proj.ending);
         setTaskFields(newTask, op.fields);
+        // A task with children is an action group; sequential:false makes it parallel.
+        if (op.sequential === false) { newTask.sequential = false; }
         if (op.fields.completed) { newTask.markComplete(); }
+        refMap[op.ref] = newTask;
         result.created[op.ref] = newTask.id.primaryKey;
       } else if (op.op === 'update') {
         var task = Task.byIdentifier(op.primaryKey);
@@ -322,18 +408,19 @@ export function buildScaffoldScript(folders: FolderSpec[], projects: ProjectSpec
   for (var j = 0; j < projects.length; j++) {
     var projSpec = projects[j];
     try {
-      var existing = flattenedProjects.find(function(p) { return p.name === projSpec.title; });
-      if (existing) {
-        // Reuse — do not push to createdProjects
-      } else {
-        var newProject;
+      var proj = flattenedProjects.find(function(p) { return p.name === projSpec.title; });
+      if (!proj) {
         if (projSpec.folderPath.length === 0) {
-          newProject = new Project(projSpec.title);
+          proj = new Project(projSpec.title);
         } else {
           var folder = ensureFolder(projSpec.folderPath);
-          newProject = new Project(projSpec.title, folder);
+          proj = new Project(projSpec.title, folder);
         }
         result.createdProjects.push(projSpec.title);
+      }
+      // Idempotently mark single-action lists (whether newly created or reused).
+      if (projSpec.singleActionList && proj.containsSingletonActions !== true) {
+        proj.containsSingletonActions = true;
       }
     } catch (e) {
       result.errors.push({ path: projSpec.folderPath.concat([projSpec.title]).join('/'), message: String(e) });
@@ -379,7 +466,7 @@ export function buildReadProjectsMetaScript(projectNames: string[]): string {
       defer: p.deferDate ? p.deferDate.getTime() : null,
       estimatedMinutes: null,
       flagged: p.flagged,
-      tags: p.tags ? p.tags.map(function(t) { return t.name; }) : []
+      tags: p.tags ? p.tags.map(function(t) { var a=[]; var c=t; while(c){ a.unshift(c.name); c=c.parent; } return a.join('/'); }) : []
     };
   }
   return JSON.stringify(result);
@@ -408,9 +495,10 @@ export function buildReadTasksByIdsScript(primaryKeys: string[]): string {
       completed: t.taskStatus === Task.Status.Completed,
       due: t.dueDate ? t.dueDate.getTime() : null,
       defer: t.deferDate ? t.deferDate.getTime() : null,
+      planned: t.plannedDate ? t.plannedDate.getTime() : null,
       estimatedMinutes: (t.estimatedMinutes === null || t.estimatedMinutes === undefined) ? null : t.estimatedMinutes,
       flagged: t.flagged,
-      tags: t.tags.map(function (x) { return x.name; })
+      tags: t.tags.map(function (x) { var a=[]; var c=x; while(c){ a.unshift(c.name); c=c.parent; } return a.join('/'); })
     };
   }
   return JSON.stringify(result);
@@ -433,6 +521,18 @@ export function createOmniFocusAdapter(run: OmniJSRunner): OmniFocusAdapter {
         parsed = JSON.parse(output) as RawOFTask[];
       } catch {
         throw new Error(`OmniFocus: failed to parse readProject output: ${output}`);
+      }
+      return parsed.map(normalizeOFTask);
+    },
+
+    async readInbox(): Promise<OmniFocusTask[]> {
+      const script = buildReadInboxScript();
+      const output = await run(script);
+      let parsed: RawOFTask[];
+      try {
+        parsed = JSON.parse(output) as RawOFTask[];
+      } catch {
+        throw new Error(`OmniFocus: failed to parse readInbox output: ${output}`);
       }
       return parsed.map(normalizeOFTask);
     },
@@ -524,7 +624,12 @@ export async function defaultRunOmniJS(source: string): Promise<string> {
     writeFileSync(tmpFile, source, "utf8");
     const result = execFileSync("osascript", ["-l", "JavaScript", "-e", driver], {
       encoding: "utf8",
-      timeout: 30000,
+      // A batch can be large on a first full-vault sync and OmniFocus slows as it fills; 30s was too
+      // low (timed out mid-push on a ~1000-task vault). 120s comfortably covers a big applyBatch.
+      timeout: 120000,
+      // A whole-vault read (readTasksByIds over ~1000 tasks with notes + all date fields) easily
+      // exceeds execFileSync's default 1MB stdout buffer → ENOBUFS. 256MB is ample headroom.
+      maxBuffer: 256 * 1024 * 1024,
     });
     return result.trim();
   } finally {

@@ -12,6 +12,7 @@ import type {
   TaskWriteFields,
 } from "./types.js";
 import { parsePrimaryKey } from "./types.js";
+import { composeOFNote, obsidianUri } from "./obsidian.js";
 
 /**
  * Pure reconcile core — computes the mutation Plan for one binding.
@@ -63,7 +64,7 @@ import { parsePrimaryKey } from "./types.js";
  *   NOTE pull semantics required by tests: OF incomplete + vault done + only OF changed -> reopen to reopenStatus;
  *        OF incomplete + vault NOT done -> leave status untouched (preserves in-progress/someday).
  *
- * SCALAR FIELDS - reconcile each of: title, due, scheduled, timeEstimate, priority.
+ * SCALAR FIELDS - reconcile each of: title, due, scheduled, deferred, flagged, timeEstimate, priority.
  *   (body is governed by bodyPolicy: for "create-only" it is written only on create and NEVER reconciled here.)
  *   For a field F with canonical vault value V, canonical OF value O, snapshot value S (snap?.[F]):
  *     vaultChanged = snap ? V !== S : true    // no snapshot -> treat vault as authoritative source
@@ -83,14 +84,16 @@ import { parsePrimaryKey } from "./types.js";
  *   Canonical mappings:
  *     title       V=task.title            O=of.name
  *     due         V=task.due              O=of.dueDate
- *     scheduled   V=task.scheduled        O=of.deferDate
+ *     scheduled   V=task.scheduled        O=of.plannedDate
+ *     deferred    V=task.deferred         O=of.deferDate
+ *     flagged     V=task.flagged          O=of.flagged
  *     timeEstimate V=task.timeEstimate    O=of.estimatedMinutes
  *     priority    V=task.priority         O=deriveOFPriority(of, config)   (snapshot field: snap.priority)
  *   "write V to OF" for a field maps to the OFWriteFields key:
- *     title->name, due->dueDate, scheduled->deferDate, timeEstimate->estimatedMinutes,
- *     priority-> flagged (true iff priority==="high") and, if priorityTags.enabled, the tag set (see tags).
- *   "write O to vault" maps to TaskWriteFields key: name->title, dueDate->due, deferDate->scheduled,
- *     estimatedMinutes->timeEstimate, and priority->priority.
+ *     title->name, due->dueDate, scheduled->plannedDate, deferred->deferDate, flagged->flagged,
+ *     timeEstimate->estimatedMinutes, priority-> (if priorityTags.enabled) the tag set only (see tags).
+ *   "write O to vault" maps to TaskWriteFields key: name->title, dueDate->due, plannedDate->scheduled,
+ *     deferDate->deferred, flagged->flagged, estimatedMinutes->timeEstimate, and priority->priority.
  *
  * PRIORITY / FLAGGED / TAGS:
  *   deriveOFPriority(of, config): if priorityTags.enabled and of.tags contains a mapped priority tag,
@@ -98,8 +101,9 @@ import { parsePrimaryKey } from "./types.js";
  *   ofTagsFor(task, config): unique list of [...task.contexts, ...task.tags]
  *     minus config.optInTag, minus every value in config.priorityTags.map,
  *     plus (priorityTags.enabled && task.priority !== "none" ? [map[task.priority]] : []).
- *   On create, OFWriteFields.tags = ofTagsFor(task, config), flagged = task.priority === "high".
- *   When priority changes and is written to OF, recompute flagged and (if enabled) the tag set.
+ *   On create, OFWriteFields.tags = ofTagsFor(task, config), flagged = task.flagged (independent field).
+ *   When priority changes and is written to OF, recompute (if enabled) the tag set. Priority no longer
+ *   drives the flag — `flagged` is its own bidirectional scalar field (V=task.flagged, O=of.flagged).
  *   Pull priority -> also updates vault tags = of.tags minus mapped priority tags (contexts are not reconstructed).
  *
  * The core NEVER emits snapshot or stamp-link mutations; the executor owns snapshots and stamping
@@ -182,16 +186,19 @@ export function reconcile(input: ReconcileInput): Plan {
 }
 
 /**
- * Compute the full OFWriteFields for a task (used on create).
+ * Compute the full OFWriteFields for a task (used on create). Exported so the plugin's structure
+ * (nested-create) pass can build identical create fields — note = back-link + description + body.
  */
-function ofWriteFieldsFor(task: TaskNote, config: ReconcileConfig): OFWriteFields {
+export function ofWriteFieldsFor(task: TaskNote, config: ReconcileConfig): OFWriteFields {
+  const uri = config.obsidianVault ? obsidianUri(task.id, config.obsidianVault) : null;
   return {
     name: task.title,
-    note: task.body,
+    note: composeOFNote(task.body, uri, task.description),
     dueDate: task.due,
-    deferDate: task.scheduled,
+    plannedDate: task.scheduled,
+    deferDate: task.deferred,
     estimatedMinutes: task.timeEstimate,
-    flagged: task.priority === "high",
+    flagged: task.flagged,
     tags: ofTagsFor(task, config),
     completed: false,
   };
@@ -202,8 +209,9 @@ function ofWriteFieldsFor(task: TaskNote, config: ReconcileConfig): OFWriteField
  */
 function ofTagsFor(task: TaskNote, config: ReconcileConfig): string[] {
   const allPriorityTagValues = Object.values(config.priorityTags.map);
+  const excluded = new Set(config.excludeTags ?? []);
   const base = [...task.contexts, ...task.tags].filter(
-    (t) => t !== config.optInTag && !allPriorityTagValues.includes(t),
+    (t) => t !== config.optInTag && !allPriorityTagValues.includes(t) && !excluded.has(t),
   );
   // Deduplicate
   const unique = [...new Set(base)];
@@ -292,7 +300,7 @@ function setsEqual(a: string[], b: string[]): boolean {
 }
 
 /**
- * Reconcile scalar fields: title, due, scheduled, timeEstimate, priority, tags.
+ * Reconcile scalar fields: title, due, scheduled, deferred, flagged, timeEstimate, priority, tags.
  */
 function reconcileScalarFields(
   task: TaskNote,
@@ -338,10 +346,26 @@ function reconcileScalarFields(
     {
       field: "scheduled",
       V: task.scheduled,
-      O: ofTask.deferDate,
+      O: ofTask.plannedDate,
       S: snap?.scheduled ?? null,
-      writeToOF: (v) => { ofFields.deferDate = v as string | null; },
+      writeToOF: (v) => { ofFields.plannedDate = v as string | null; },
       writeToVault: (o) => { vaultFields.scheduled = o as string | null; },
+    },
+    {
+      field: "deferred",
+      V: task.deferred,
+      O: ofTask.deferDate,
+      S: snap?.deferred ?? null,
+      writeToOF: (v) => { ofFields.deferDate = v as string | null; },
+      writeToVault: (o) => { vaultFields.deferred = o as string | null; },
+    },
+    {
+      field: "flagged",
+      V: task.flagged,
+      O: ofTask.flagged,
+      S: snap?.flagged ?? false,
+      writeToOF: (v) => { ofFields.flagged = v as boolean; },
+      writeToVault: (o) => { vaultFields.flagged = o as boolean; },
     },
     {
       field: "timeEstimate",
@@ -357,9 +381,9 @@ function reconcileScalarFields(
       O: ofPriority,
       S: snapPriority,
       writeToOF: (v) => {
-        const p = v as TaskNotePriority;
-        // Only write flagged here; tags field handles the tag set.
-        ofFields.flagged = p === "high";
+        // Priority drives OF priority TAGS only (handled by the tags field); it no longer
+        // touches the flag — `flagged` is now an independent bidirectional field.
+        void v;
       },
       writeToVault: (o) => {
         const p = o as TaskNotePriority;

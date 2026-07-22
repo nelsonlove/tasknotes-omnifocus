@@ -63,8 +63,10 @@ describe("normalizeTNTask", () => {
       status: "in-progress",
       due: "2026-07-20T09:00:00.000Z",
       scheduled: "2026-07-18T00:00:00.000Z",
+      deferred: null,
       timeEstimate: 45,
       priority: "high",
+      flagged: false,
       tags: ["x"],
       contexts: ["@home"],
       projects: [],
@@ -92,6 +94,18 @@ describe("normalizeTNTask", () => {
     expect(t.tags).toEqual([]);
     expect(t.contexts).toEqual([]);
   });
+
+  it("reads the deferred/flagged userFields (deferred canonicalized, flagged defaulting to false)", () => {
+    const t = normalizeTNTask(rawTN({ deferred: "2026-07-17", flagged: true }), COMPLETED);
+    expect(t.deferred).toBe("2026-07-17T00:00:00.000Z");
+    expect(t.flagged).toBe(true);
+  });
+
+  it("defaults deferred to null and flagged to false when absent", () => {
+    const t = normalizeTNTask(rawTN(), COMPLETED);
+    expect(t.deferred).toBeNull();
+    expect(t.flagged).toBe(false);
+  });
 });
 
 describe("buildUpdateBody", () => {
@@ -103,6 +117,16 @@ describe("buildUpdateBody", () => {
 
   it("does not emit keys for fields that were not provided", () => {
     expect(Object.keys(buildUpdateBody({ title: "X" }))).toEqual(["title"]);
+  });
+
+  it("forwards the deferred/flagged/scheduled userFields to the update body", () => {
+    expect(
+      buildUpdateBody({ deferred: "2026-07-17T00:00:00.000Z", flagged: true, scheduled: "2026-07-18T00:00:00.000Z" }),
+    ).toEqual({
+      deferred: "2026-07-17T00:00:00.000Z",
+      flagged: true,
+      scheduled: "2026-07-18T00:00:00.000Z",
+    });
   });
 });
 

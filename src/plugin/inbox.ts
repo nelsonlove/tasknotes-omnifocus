@@ -1,0 +1,59 @@
+// Pure, Obsidian-free helpers for the OmniFocus inbox → vault capture pass. Kept side-effect free so
+// they are unit-testable in isolation; the plugin (main.ts) wires them to the vault APIs.
+import type { OmniFocusTask } from "../core/types.js";
+
+/** Characters illegal in vault/filesystem filenames (path separators, reserved chars, and control
+ * bytes \x00-\x1f) — replaced with a space. */
+// eslint-disable-next-line no-control-regex
+const ILLEGAL_CHARS = /[/\\:*?"<>|\x00-\x1f]/g;
+
+/**
+ * Turn a task title into a safe note filename (WITHOUT the `.md` extension):
+ * replace illegal characters, strip leading dots, collapse whitespace, trim, and cap length to
+ * ~180 chars. Never returns an empty string — falls back to "Untitled".
+ */
+export function sanitizeFilename(title: string): string {
+  let name = (title ?? "").replace(ILLEGAL_CHARS, " ");
+  // Collapse runs of whitespace to a single space.
+  name = name.replace(/\s+/g, " ").trim();
+  // Strip leading dots (avoid hidden files) and any whitespace they left behind.
+  name = name.replace(/^\.+/, "").trim();
+  // Cap length; trim again so we never end on a trailing space.
+  if (name.length > 180) name = name.slice(0, 180).trim();
+  return name.length > 0 ? name : "Untitled";
+}
+
+/**
+ * Idempotency filter: keep only inbox tasks whose primaryKey is NOT already captured in the vault.
+ * `capturedPks` is the set of OmniFocus primaryKeys already linked from an existing TaskNote.
+ */
+export function filterUncaptured(
+  inboxTasks: OmniFocusTask[],
+  capturedPks: Set<string>,
+): OmniFocusTask[] {
+  return inboxTasks.filter((t) => !capturedPks.has(t.primaryKey));
+}
+
+/**
+ * Build the frontmatter object for a new captured TaskNote from an OmniFocus inbox task.
+ * Optional date fields are included only when non-null. Note the field mapping:
+ * OmniFocus `plannedDate` → vault `scheduled`, `deferDate` → `deferred`, `dueDate` → `due`.
+ * Does NOT set `uid` (the plugin stamps it at write time) or `projects` (captures are unfiled).
+ */
+export function buildCaptureFrontmatter(
+  ofTask: OmniFocusTask,
+  opts: { markerTag: string; doneStatus: string; openStatus: string },
+): Record<string, unknown> {
+  const fm: Record<string, unknown> = {
+    title: ofTask.name,
+    tags: [opts.markerTag],
+    status: ofTask.completed ? opts.doneStatus : opts.openStatus,
+    omnifocusUrl: "omnifocus:///task/" + ofTask.primaryKey,
+  };
+  if (ofTask.dueDate !== null) fm.due = ofTask.dueDate;
+  // OmniFocus planned date maps to the vault's `scheduled` field.
+  if (ofTask.plannedDate !== null) fm.scheduled = ofTask.plannedDate;
+  if (ofTask.deferDate !== null) fm.deferred = ofTask.deferDate;
+  fm.flagged = ofTask.flagged;
+  return fm;
+}

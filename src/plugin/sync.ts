@@ -83,9 +83,13 @@ export function buildReconcileInput(args: BuildInputArgs): ReconcileInput {
  * Derive the post-sync Snapshot for a converged (task, ofTask) pair. Vault side is authoritative
  * for scalars/completion; OmniFocus side is authoritative for the OF-facing flag + tag set.
  *  linkId: ofTask.primaryKey
- *  title/body/isCompleted/due/scheduled/timeEstimate/priority <- task.*
+ *  title/body/isCompleted/due/scheduled/deferred/timeEstimate/priority <- task.*
  *  flagged <- ofTask.flagged
  *  tags <- ofTask.tags
+ *
+ * Post-convergence the vault scalar equals its OF mirror on both the task path (scheduled↔plannedDate,
+ * deferred↔deferDate) and the project-meta path (scheduled↔deferDate; a project has no plannedDate, and
+ * `deferred` is unused there), so taking scalars from the vault is correct and shared-path safe.
  */
 export function deriveSnapshot(task: TaskNote, ofTask: OmniFocusTask, _config: ReconcileConfig): Snapshot {
   return {
@@ -95,6 +99,7 @@ export function deriveSnapshot(task: TaskNote, ofTask: OmniFocusTask, _config: R
     isCompleted: task.isCompleted,
     due: task.due,
     scheduled: task.scheduled,
+    deferred: task.deferred,
     timeEstimate: task.timeEstimate,
     priority: task.priority,
     flagged: ofTask.flagged,

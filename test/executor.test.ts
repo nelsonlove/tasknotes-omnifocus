@@ -10,6 +10,7 @@ const wf = (o: Partial<OFWriteFields> = {}): OFWriteFields => ({
   note: null,
   dueDate: null,
   deferDate: null,
+  plannedDate: null,
   estimatedMinutes: null,
   flagged: false,
   tags: [],

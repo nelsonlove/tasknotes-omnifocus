@@ -37,8 +37,10 @@ function task(o: Partial<TaskNote> = {}): TaskNote {
     status: "open",
     due: null,
     scheduled: null,
+    deferred: null,
     timeEstimate: null,
     priority: "none",
+    flagged: false,
     tags: [],
     contexts: [],
     projects: [],
@@ -56,6 +58,7 @@ function of(o: Partial<OmniFocusTask> = {}): OmniFocusTask {
     completed: false,
     dueDate: null,
     deferDate: null,
+    plannedDate: null,
     estimatedMinutes: null,
     flagged: false,
     tags: [],
@@ -71,6 +74,7 @@ function snap(o: Partial<Snapshot> = {}): Snapshot {
     isCompleted: false,
     due: null,
     scheduled: null,
+    deferred: null,
     timeEstimate: null,
     priority: "none",
     flagged: false,
@@ -131,20 +135,38 @@ describe("push — create", () => {
     expect(byKind(plan, "createOFTask")[0].fields.note).toBe("hello");
   });
 
-  it("maps due→dueDate, scheduled→deferDate, timeEstimate→estimatedMinutes, priority high→flagged+tag", () => {
+  it("prepends an Obsidian back-link to the note when obsidianVault is set", () => {
+    const inp = input({ direction: "push", tasks: [task({ id: "Dir/My Task.md", body: "hello" })] });
+    inp.config = { ...cfg, obsidianVault: "obsidian" };
+    const note = byKind(reconcile(inp), "createOFTask")[0].fields.note;
+    expect(note).toBe("obsidian://open?vault=obsidian&file=Dir%2FMy%20Task\n\nhello");
+  });
+
+  it("maps due→dueDate, scheduled→plannedDate, deferred→deferDate, timeEstimate→estimatedMinutes, flagged→flagged, priority high→tag", () => {
     const t = task({
       due: "2026-07-20T09:00:00",
       scheduled: "2026-07-18T09:00:00",
+      deferred: "2026-07-17T09:00:00",
       timeEstimate: 30,
       priority: "high",
+      flagged: true,
     });
     const f = reconcile(input({ direction: "push", tasks: [t] })).mutations[0];
     expect(f.kind).toBe("createOFTask");
     if (f.kind !== "createOFTask") throw new Error();
     expect(f.fields.dueDate).toBe("2026-07-20T09:00:00");
-    expect(f.fields.deferDate).toBe("2026-07-18T09:00:00");
+    expect(f.fields.plannedDate).toBe("2026-07-18T09:00:00");
+    expect(f.fields.deferDate).toBe("2026-07-17T09:00:00");
     expect(f.fields.estimatedMinutes).toBe(30);
     expect(f.fields.flagged).toBe(true);
+    expect(sortedTags(f.fields.tags)).toContain("priority:high");
+  });
+
+  it("does not flag an OF task on create just because priority is high (flag is decoupled)", () => {
+    const t = task({ priority: "high", flagged: false });
+    const f = reconcile(input({ direction: "push", tasks: [t] })).mutations[0];
+    if (f.kind !== "createOFTask") throw new Error();
+    expect(f.fields.flagged).toBe(false);
     expect(sortedTags(f.fields.tags)).toContain("priority:high");
   });
 
@@ -153,6 +175,14 @@ describe("push — create", () => {
     const f = reconcile(input({ direction: "push", tasks: [t] })).mutations[0];
     if (f.kind !== "createOFTask") throw new Error();
     expect(sortedTags(f.fields.tags)).toEqual(["@home", "a"]);
+  });
+
+  it("drops excludeTags (e.g. the TaskNotes 'task' marker) from the OF tag set", () => {
+    const inp = input({ direction: "push", tasks: [task({ tags: ["task", "keep"] })] });
+    inp.config = { ...cfg, excludeTags: ["task"] };
+    const f = reconcile(inp).mutations[0];
+    if (f.kind !== "createOFTask") throw new Error();
+    expect(sortedTags(f.fields.tags)).toEqual(["keep"]);
   });
 
   it("does not create for a completed unlinked task", () => {
@@ -436,13 +466,135 @@ describe("tags (first-class)", () => {
   it("pull: a priority-only change does not rewrite unrelated vault tags (decoupled)", () => {
     const inp = converged({
       t: { tags: ["keep"], priority: "none" },
-      o: { tags: ["keep"], flagged: true },
+      o: { tags: ["keep"], flagged: true, plannedDate: null },
       s: { tags: ["keep"], priority: "none", flagged: false },
     });
     inp.direction = "pull";
     const ups = byKind(reconcile(inp), "updateTask");
     expect(ups).toHaveLength(1);
+    // flagged pulls back independently now; priority derives from the OF flag; tags stay untouched.
     expect(ups[0].fields.priority).toBe("high");
+    expect(ups[0].fields.flagged).toBe(true);
     expect("tags" in ups[0].fields).toBe(false);
+  });
+});
+
+// =====================================================================
+// scheduled↔plannedDate remap + deferred↔deferDate (cycle 2 scheduling model).
+describe("scheduled ↔ plannedDate", () => {
+  it("push: vault scheduled writes OF plannedDate (not deferDate)", () => {
+    const inp = converged({
+      t: { scheduled: "2026-07-18T09:00:00.000Z" },
+      o: { plannedDate: null },
+      s: { scheduled: null },
+    });
+    inp.direction = "push";
+    const ups = byKind(reconcile(inp), "updateOFTask");
+    expect(ups).toHaveLength(1);
+    expect(ups[0].fields.plannedDate).toBe("2026-07-18T09:00:00.000Z");
+    expect("deferDate" in ups[0].fields).toBe(false);
+  });
+
+  it("pull: an OF plannedDate change flows back to vault scheduled", () => {
+    const inp = converged({
+      t: { scheduled: null },
+      o: { plannedDate: "2026-07-18T09:00:00.000Z" },
+      s: { scheduled: null },
+    });
+    inp.direction = "pull";
+    const ups = byKind(reconcile(inp), "updateTask");
+    expect(ups).toHaveLength(1);
+    expect(ups[0].fields.scheduled).toBe("2026-07-18T09:00:00.000Z");
+  });
+
+  it("pull: an OF deferDate difference does NOT touch vault scheduled (defer is 'deferred' now)", () => {
+    const inp = converged({
+      t: { scheduled: null, deferred: null },
+      o: { plannedDate: null, deferDate: "2026-07-18T09:00:00.000Z" },
+      s: { scheduled: null, deferred: null },
+    });
+    inp.direction = "pull";
+    const ups = byKind(reconcile(inp), "updateTask");
+    expect(ups).toHaveLength(1);
+    expect("scheduled" in ups[0].fields).toBe(false);
+    expect(ups[0].fields.deferred).toBe("2026-07-18T09:00:00.000Z");
+  });
+});
+
+describe("deferred ↔ deferDate", () => {
+  it("push: vault deferred writes OF deferDate", () => {
+    const inp = converged({
+      t: { deferred: "2026-07-17T09:00:00.000Z" },
+      o: { deferDate: null },
+      s: { deferred: null },
+    });
+    inp.direction = "push";
+    const ups = byKind(reconcile(inp), "updateOFTask");
+    expect(ups).toHaveLength(1);
+    expect(ups[0].fields.deferDate).toBe("2026-07-17T09:00:00.000Z");
+    expect("plannedDate" in ups[0].fields).toBe(false);
+  });
+
+  it("pull: an OF deferDate change flows back to vault deferred", () => {
+    const inp = converged({
+      t: { deferred: null },
+      o: { deferDate: "2026-07-17T09:00:00.000Z" },
+      s: { deferred: null },
+    });
+    inp.direction = "pull";
+    const ups = byKind(reconcile(inp), "updateTask");
+    expect(ups).toHaveLength(1);
+    expect(ups[0].fields.deferred).toBe("2026-07-17T09:00:00.000Z");
+  });
+});
+
+describe("flagged (bidirectional, decoupled from priority)", () => {
+  it("push: vault flagged=true writes the OF flag", () => {
+    const inp = converged({ t: { flagged: true }, o: { flagged: false }, s: { flagged: false } });
+    inp.direction = "push";
+    const ups = byKind(reconcile(inp), "updateOFTask");
+    expect(ups).toHaveLength(1);
+    expect(ups[0].fields.flagged).toBe(true);
+  });
+
+  it("pull: an OF flag on flows back to vault flagged=true", () => {
+    const inp = converged({ t: { flagged: false }, o: { flagged: true }, s: { flagged: false } });
+    inp.direction = "pull";
+    const ups = byKind(reconcile(inp), "updateTask");
+    expect(ups).toHaveLength(1);
+    expect(ups[0].fields.flagged).toBe(true);
+  });
+
+  it("pull: an OF flag off flows back to vault flagged=false", () => {
+    const inp = converged({ t: { flagged: true }, o: { flagged: false }, s: { flagged: true } });
+    inp.direction = "pull";
+    const ups = byKind(reconcile(inp), "updateTask");
+    expect(ups).toHaveLength(1);
+    expect(ups[0].fields.flagged).toBe(false);
+  });
+
+  it("sync: only the vault flag changed -> pushes to OF, no conflict", () => {
+    const inp = converged({ t: { flagged: true }, o: { flagged: false }, s: { flagged: false } });
+    const plan = reconcile(inp);
+    expect(byKind(plan, "updateOFTask")[0].fields.flagged).toBe(true);
+    expect(plan.conflicts).toHaveLength(0);
+  });
+
+  it("sync: only the OF flag changed -> pulls to vault, no conflict", () => {
+    const inp = converged({ t: { flagged: false }, o: { flagged: true }, s: { flagged: false } });
+    const plan = reconcile(inp);
+    expect(byKind(plan, "updateTask")[0].fields.flagged).toBe(true);
+    expect(plan.conflicts).toHaveLength(0);
+  });
+
+  it("sync: flag matching the snapshot on both sides -> no flag mutation", () => {
+    // OF flag on derives priority "high"; align vault priority so priority doesn't drive a mutation.
+    const inp = converged({
+      t: { flagged: true, priority: "high" },
+      o: { flagged: true, tags: ["priority:high"] },
+      s: { flagged: true, priority: "high", tags: ["priority:high"] },
+    });
+    const plan = reconcile(inp);
+    expect(plan.mutations).toHaveLength(0);
   });
 });

@@ -9,6 +9,7 @@ const snap = (o: Partial<Snapshot> = {}): Snapshot => ({
   isCompleted: false,
   due: null,
   scheduled: null,
+  deferred: null,
   timeEstimate: null,
   priority: "none",
   flagged: false,

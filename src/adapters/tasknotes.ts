@@ -15,7 +15,9 @@ export interface RawTNTask {
   priority?: string;
   due?: string | null;
   scheduled?: string | null;
+  deferred?: string | null;
   timeEstimate?: number | null;
+  flagged?: boolean;
   tags?: string[];
   contexts?: string[];
   projects?: string[];
@@ -52,8 +54,8 @@ export function mapTNPriority(p: string | undefined): TaskNotePriority {
  * Normalize a raw TaskNotes task into the core TaskNote.
  *  - id, title straight; body <- details (null if absent)
  *  - status straight; isCompleted <- completedStatuses.includes(status)
- *  - due/scheduled via canonicalDate; timeEstimate <- timeEstimate ?? null
- *  - priority via mapTNPriority; tags/contexts <- [] if absent
+ *  - due/scheduled/deferred via canonicalDate; timeEstimate <- timeEstimate ?? null
+ *  - priority via mapTNPriority; flagged <- flagged ?? false; tags/contexts <- [] if absent
  *  - omnifocusUrl <- null (link lives in the plugin data.json table, set by the caller)
  *  - inScope <- true (scope is a caller concern; the plugin overrides for de-surface candidates)
  */
@@ -66,8 +68,10 @@ export function normalizeTNTask(raw: RawTNTask, completedStatuses: string[]): Ta
     isCompleted: completedStatuses.includes(raw.status),
     due: canonicalDate(raw.due),
     scheduled: canonicalDate(raw.scheduled),
+    deferred: canonicalDate(raw.deferred),
     timeEstimate: raw.timeEstimate ?? null,
     priority: mapTNPriority(raw.priority),
+    flagged: raw.flagged ?? false,
     tags: raw.tags ?? [],
     contexts: raw.contexts ?? [],
     projects: raw.projects ?? [],
@@ -78,15 +82,19 @@ export function normalizeTNTask(raw: RawTNTask, completedStatuses: string[]): Ta
 
 /**
  * Build the PUT body from core TaskWriteFields (only keys present in `fields`):
- *  title->title, due->due, scheduled->scheduled, timeEstimate->timeEstimate, tags->tags,
+ *  title->title, due->due, scheduled->scheduled, deferred->deferred, timeEstimate->timeEstimate,
+ *  flagged->flagged, tags->tags,
  *  priority-> the TaskNotes priority string ("none"|"low"|"normal"|"high", symmetric with mapTNPriority).
+ *  (deferred and flagged are TaskNotes userFields; verified the REST API accepts and echoes them.)
  */
 export function buildUpdateBody(fields: Partial<TaskWriteFields>): Record<string, unknown> {
   const body: Record<string, unknown> = {};
   if ("title" in fields) body.title = fields.title;
   if ("due" in fields) body.due = fields.due;
   if ("scheduled" in fields) body.scheduled = fields.scheduled;
+  if ("deferred" in fields) body.deferred = fields.deferred;
   if ("timeEstimate" in fields) body.timeEstimate = fields.timeEstimate;
+  if ("flagged" in fields) body.flagged = fields.flagged;
   if ("tags" in fields) body.tags = fields.tags;
   if ("priority" in fields) body.priority = fields.priority; // "none"|"low"|"normal"|"high" pass through
   return body;
