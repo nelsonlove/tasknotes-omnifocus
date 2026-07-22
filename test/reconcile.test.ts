@@ -442,12 +442,23 @@ describe("tags (first-class)", () => {
     expect(byKind(reconcile(inp), "updateOFTask")).toHaveLength(0);
   });
 
-  it("pull: writes an OF tag change back to the vault (minus priority tags)", () => {
+  it("pull: does NOT write OF tag changes back to the vault (tags are push-only)", () => {
+    // ofTagsFor merges vault contexts+tags into one OF set; pulling that back would demote contexts
+    // into tags and lose the split, so the vault tag set is never overwritten from OmniFocus.
     const inp = converged({ t: { tags: ["x"] }, o: { tags: ["x", "y"] }, s: { tags: ["x"] } });
     inp.direction = "pull";
     const ups = byKind(reconcile(inp), "updateTask");
-    expect(ups).toHaveLength(1);
-    expect(sortedTags(ups[0].fields.tags)).toEqual(["x", "y"]);
+    // No vault write at all — the OF-side tag addition does not flow back.
+    expect(ups).toHaveLength(0);
+  });
+
+  it("sync: an OF-only tag change is NOT written back to the vault (push-only)", () => {
+    const inp = converged({ t: { tags: ["x"] }, o: { tags: ["x", "y"] }, s: { tags: ["x"] } });
+    const plan = reconcile(inp);
+    // Only OF changed -> nothing to push to OF, and tags never flow OF -> vault.
+    expect(byKind(plan, "updateOFTask")).toHaveLength(0);
+    expect(byKind(plan, "updateTask")).toHaveLength(0);
+    expect(plan.conflicts).toHaveLength(0);
   });
 
   it("sync: a tag conflict resolves vault-canonical and logs a 'tags' conflict", () => {

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   buildBatchScript,
+  buildReadAllProjectsScript,
   buildReadInboxScript,
   buildReadProjectsMetaScript,
   buildReadScript,
@@ -165,6 +166,43 @@ describe("buildReadScript / buildBatchScript", () => {
     // Uses the folder/project constructors (pure OmniJS, not JXA).
     expect(script).toContain("new Folder");
     expect(script).toContain("new Project");
+  });
+});
+
+describe("buildReadAllProjectsScript", () => {
+  it("iterates every project and emits the same per-task fields as the project read script", () => {
+    const script = buildReadAllProjectsScript();
+    expect(script).toContain("flattenedProjects");
+    expect(script).toContain("flattenedTasks");
+    expect(script).toContain("JSON.stringify");
+    expect(script).toContain("planned:");
+    expect(script).toContain("task.plannedDate");
+    // Excludes dropped tasks, same as buildReadScript.
+    expect(script).toContain("Task.Status.Dropped");
+  });
+});
+
+describe("adapter.readAllProjects", () => {
+  it("runs ONE script and returns every project's tasks normalized, keyed by name", async () => {
+    const raw: Record<string, RawOFTask[]> = {
+      ProjA: [rawTask({ id: "a1", due: "2026-07-20" })],
+      ProjB: [rawTask({ id: "b1", completed: true }), rawTask({ id: "b2" })],
+    };
+    const run = vi.fn().mockResolvedValue(JSON.stringify(raw));
+    const adapter = createOmniFocusAdapter(run);
+    const out = await adapter.readAllProjects();
+    expect(run).toHaveBeenCalledOnce();
+    expect(out.ProjA).toHaveLength(1);
+    expect(out.ProjA[0].primaryKey).toBe("a1");
+    expect(out.ProjA[0].dueDate).toBe("2026-07-20T00:00:00.000Z");
+    expect(out.ProjB).toHaveLength(2);
+    expect(out.ProjB[0].completed).toBe(true);
+  });
+
+  it("throws a clear error when the runner output is not valid JSON", async () => {
+    const run = vi.fn().mockResolvedValue("not json");
+    const adapter = createOmniFocusAdapter(run);
+    await expect(adapter.readAllProjects()).rejects.toThrow(/omnifocus/i);
   });
 });
 

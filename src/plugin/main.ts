@@ -235,6 +235,9 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         let clears = 0;
         let conflicts = 0;
 
+        // ONE read of every project's tasks (instead of a readProject spawn per project below).
+        const allProjects = await omnifocus.readAllProjects();
+
         for (const proj of projects) {
           const leafIds: string[] = [];
           const collect = (items: import("./hierarchy.js").OFItem[]): void => {
@@ -253,7 +256,7 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
             .filter((t): t is TaskNote => t !== undefined && linkedPk(t.id) !== null);
           let pCreates = 0, pUpdates = 0, pDeletes = 0, pStatuses = 0, pClears = 0, pConflicts = 0;
           if (members.length > 0) {
-            const ofTasks = await omnifocus.readProject(proj.name);
+            const ofTasks = allProjects[proj.name] ?? [];
             const plan = reconcile(
               buildReconcileInput({
                 direction,
@@ -448,6 +451,11 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       //        OmniFocus-side edit flows back to the vault and a vault edit pushes to OmniFocus.
       let fieldApplied = 0;
       let fieldConflicts = 0;
+      // ONE read of every project's tasks up front (instead of a readProject spawn per project). The
+      // leaves reconciled here (non-created linked tasks) aren't mutated by the create/enrich passes
+      // above, so this pre-read is current for them; the post-executePlan re-snapshot below still does
+      // a targeted readProject for the (rare) projects that actually changed.
+      const allProjects = await omnifocus.readAllProjects();
       for (const proj of projects) {
         const memberIds: string[] = [];
         const collect = (items: import("./hierarchy.js").OFItem[]): void => {
@@ -463,7 +471,7 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
           // so there is nothing to reconcile (and it avoids a per-project readProject on a fresh push).
           .filter((t): t is TaskNote => t !== undefined && linkedPk(t.id) !== null && !createdIds.has(t.id));
         if (members.length === 0) continue;
-        const ofTasks = await omnifocus.readProject(proj.name);
+        const ofTasks = allProjects[proj.name] ?? [];
         const plan = reconcile(
           buildReconcileInput({
             direction,

@@ -72,6 +72,13 @@ export interface OmniFocusAdapter {
   /** ONE osascript spawn: returns every task in the named project, normalized. */
   readProject(project: string): Promise<OmniFocusTask[]>;
   /**
+   * ONE osascript spawn: returns EVERY project's tasks, normalized, keyed by project NAME. Replaces
+   * the per-project readProject fan-out on a full sync (one spawn instead of ~one per project). A
+   * name collision (two projects sharing a name) keeps the last one, consistent with the name-keyed
+   * model used elsewhere. Callers look up `result[projectName] ?? []`.
+   */
+  readAllProjects(): Promise<Record<string, OmniFocusTask[]>>;
+  /**
    * ONE osascript spawn: returns every top-level OmniFocus INBOX task (tasks with no containing
    * project), normalized. Used by the inbox-capture pass to pull OF-native captures into the vault.
    */
@@ -154,6 +161,40 @@ export function buildReadScript(project: string): string {
         tags: task.tags.map(function (t) { var p=[]; var c=t; while(c){ p.unshift(c.name); c=c.parent; } return p.join('/'); })
       };
     });
+  return JSON.stringify(result);
+})();
+`.trim();
+}
+
+/**
+ * Build the OmniJS source that reads EVERY project's tasks in ONE spawn and ends with
+ * JSON.stringify(result), result being Record<projectName, RawOFTask[]>. Iterates `flattenedProjects`
+ * and, for each, maps its `flattenedTasks` to the SAME RawOFTask shape buildReadScript emits (same
+ * fields, same dropped-filter, same nested-tag join), keyed by the project name. A name collision
+ * keeps the last project seen (name-keyed model, consistent with readProjectsMeta/ensureStructure).
+ */
+export function buildReadAllProjectsScript(): string {
+  return `
+(function() {
+  var result = {};
+  flattenedProjects.forEach(function (proj) {
+    result[proj.name] = proj.flattenedTasks
+      .filter(function (task) { return task.taskStatus !== Task.Status.Dropped; })
+      .map(function (task) {
+        return {
+          id: task.id.primaryKey,
+          name: task.name,
+          note: task.note || null,
+          completed: task.taskStatus === Task.Status.Completed,
+          due: task.dueDate ? task.dueDate.getTime() : null,
+          defer: task.deferDate ? task.deferDate.getTime() : null,
+          planned: task.plannedDate ? task.plannedDate.getTime() : null,
+          estimatedMinutes: (task.estimatedMinutes === null || task.estimatedMinutes === undefined) ? null : task.estimatedMinutes,
+          flagged: task.flagged,
+          tags: task.tags.map(function (t) { var p=[]; var c=t; while(c){ p.unshift(c.name); c=c.parent; } return p.join('/'); })
+        };
+      });
+  });
   return JSON.stringify(result);
 })();
 `.trim();
@@ -523,6 +564,22 @@ export function createOmniFocusAdapter(run: OmniJSRunner): OmniFocusAdapter {
         throw new Error(`OmniFocus: failed to parse readProject output: ${output}`);
       }
       return parsed.map(normalizeOFTask);
+    },
+
+    async readAllProjects(): Promise<Record<string, OmniFocusTask[]>> {
+      const script = buildReadAllProjectsScript();
+      const output = await run(script);
+      let parsed: Record<string, RawOFTask[]>;
+      try {
+        parsed = JSON.parse(output) as Record<string, RawOFTask[]>;
+      } catch {
+        throw new Error(`OmniFocus: failed to parse readAllProjects output: ${output}`);
+      }
+      const result: Record<string, OmniFocusTask[]> = {};
+      for (const [name, tasks] of Object.entries(parsed)) {
+        result[name] = tasks.map(normalizeOFTask);
+      }
+      return result;
     },
 
     async readInbox(): Promise<OmniFocusTask[]> {

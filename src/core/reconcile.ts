@@ -13,6 +13,7 @@ import type {
 } from "./types.js";
 import { parsePrimaryKey } from "./types.js";
 import { composeOFNote, obsidianUri } from "./obsidian.js";
+import { resolveCompletion, resolveScalarField } from "./reconcileScalar.js";
 
 /**
  * Pure reconcile core — computes the mutation Plan for one binding.
@@ -104,7 +105,11 @@ import { composeOFNote, obsidianUri } from "./obsidian.js";
  *   On create, OFWriteFields.tags = ofTagsFor(task, config), flagged = task.flagged (independent field).
  *   When priority changes and is written to OF, recompute (if enabled) the tag set. Priority no longer
  *   drives the flag — `flagged` is its own bidirectional scalar field (V=task.flagged, O=of.flagged).
- *   Pull priority -> also updates vault tags = of.tags minus mapped priority tags (contexts are not reconstructed).
+ *   TAGS are PUSH-ONLY (vault -> OF): ofTagsFor merges vault contexts + tags into one flat OF tag set,
+ *   so writing that back to vault `tags` would demote contexts into tags and lose the split. The vault
+ *   tag set is therefore never overwritten from OmniFocus (pull/sync never write vault tags); only the
+ *   push side (and the vault-canonical sync resolution) is applied. Priority is still pulled back to
+ *   vault `priority` on its own (from the OF flag/tags), independent of the tag set.
  *
  * The core NEVER emits snapshot or stamp-link mutations; the executor owns snapshots and stamping
  * the omnifocus_url after a create. clearLink is the one link-related mutation the core emits.
@@ -252,26 +257,7 @@ function reconcileCompletion(
   const ofDone = ofTask.completed;
   const snapDone = snap?.isCompleted ?? false;
 
-  let target: boolean;
-
-  if (direction === "push") {
-    target = vaultDone;
-  } else if (direction === "pull") {
-    target = ofDone;
-  } else {
-    // sync
-    const vc = vaultDone !== snapDone;
-    const oc = ofDone !== snapDone;
-    if (vc && oc) {
-      target = vaultDone || ofDone; // done-wins
-    } else if (vc) {
-      target = vaultDone;
-    } else if (oc) {
-      target = ofDone;
-    } else {
-      target = vaultDone; // == ofDone == snapDone
-    }
-  }
+  const target = resolveCompletion(vaultDone, ofDone, snapDone, direction);
 
   if (ofTask.completed !== target) {
     ofFields.completed = target;
@@ -394,44 +380,22 @@ function reconcileScalarFields(
   ];
 
   for (const { field, V, O, S, writeToOF, writeToVault } of scalarFieldDefs) {
-    const vaultChanged = snap ? V !== S : true;
-    const ofChanged = snap ? O !== S : false;
-
-    if (direction === "push") {
-      if (V !== O) {
-        writeToOF(V);
-      }
-    } else if (direction === "pull") {
-      if (O !== V && (ofChanged || !snap)) {
-        writeToVault(O);
-      }
-    } else {
-      // sync
-      if (vaultChanged && ofChanged && V !== O) {
-        // Conflict
-        if (config.conflict === "vault-canonical") {
-          writeToOF(V);
-          conflicts.push({ linkId, field, vaultValue: V, ofValue: O, resolution: "vault" });
-        } else if (config.conflict === "of-canonical") {
-          writeToVault(O);
-          conflicts.push({ linkId, field, vaultValue: V, ofValue: O, resolution: "of" });
-        } else {
-          // flag-and-hold: write nothing to either side
-          conflicts.push({ linkId, field, vaultValue: V, ofValue: O, resolution: "held" });
-        }
-      } else if (vaultChanged && V !== O) {
-        writeToOF(V);
-      } else if (ofChanged && O !== V) {
-        writeToVault(O);
-      }
-    }
+    const res = resolveScalarField({ V, O, S, hasSnap: !!snap, direction, config, field, linkId });
+    if ("writeProject" in res) writeToOF(res.writeProject);
+    if ("writeVault" in res) writeToVault(res.writeVault);
+    if (res.conflict) conflicts.push(res.conflict);
   }
 
-  // --- TAGS (set field, order-independent equality) ---
-  // V = ofTagsFor(task, config) — canonical vault value (includes priority tag if enabled)
+  // --- TAGS (set field, order-independent equality) — PUSH-ONLY (vault -> OmniFocus) ---
+  // V = ofTagsFor(task, config) — canonical vault value (contexts + tags [+ priority tag if enabled])
   // O = ofTask.tags — current OmniFocus tag set
   // S = snap?.tags ?? [] — last-synced tag set
-  const allPriorityTagValues = Object.values(config.priorityTags.map);
+  //
+  // Tags flow vault -> OmniFocus ONLY, never back. ofTagsFor MERGES the vault's `contexts` and `tags`
+  // (plus the priority tag) into one flat OmniFocus tag set; writing that merged set back to vault
+  // `tags` would demote every `context` into `tags` and permanently lose the contexts/tags split. So —
+  // like priority/flag on a project node — the vault tag set is never overwritten from OmniFocus. Only
+  // pushes (and the vault-canonical sync resolution, itself a vault->OF write) touch the OmniFocus side.
   const V_tags = ofTagsFor(task, config);
   const O_tags = ofTask.tags;
   const S_tags: string[] = snap?.tags ?? [];
@@ -440,28 +404,23 @@ function reconcileScalarFields(
   const ofTagsChanged = snap ? !setsEqual(O_tags, S_tags) : false;
 
   const writeTagsToOF = () => { ofFields.tags = ofTagsFor(task, config); };
-  // Pull tags back to vault: OF tags minus mapped priority-tag values
-  const writeTagsToVault = () => {
-    vaultFields.tags = O_tags.filter((t) => !allPriorityTagValues.includes(t));
-  };
 
   if (direction === "push") {
     if (!setsEqual(V_tags, O_tags)) {
       writeTagsToOF();
     }
   } else if (direction === "pull") {
-    if (!setsEqual(O_tags, V_tags) && (ofTagsChanged || !snap)) {
-      writeTagsToVault();
-    }
+    // Push-only: vault `tags`/`contexts` are never overwritten from OmniFocus.
   } else {
-    // sync
+    // sync — push vault tag changes to OF; never write OF tags back to the vault.
     if (vaultTagsChanged && ofTagsChanged && !setsEqual(V_tags, O_tags)) {
-      // Conflict
+      // Both sides changed the tag set. Only vault-canonical writes (a vault->OF push); of-canonical
+      // and flag-and-hold write nothing (the vault tag set is never overwritten), but the conflict is
+      // still recorded so it surfaces for manual resolution.
       if (config.conflict === "vault-canonical") {
         writeTagsToOF();
         conflicts.push({ linkId, field: "tags", vaultValue: V_tags, ofValue: O_tags, resolution: "vault" });
       } else if (config.conflict === "of-canonical") {
-        writeTagsToVault();
         conflicts.push({ linkId, field: "tags", vaultValue: V_tags, ofValue: O_tags, resolution: "of" });
       } else {
         // flag-and-hold: write nothing to either side
@@ -469,8 +428,7 @@ function reconcileScalarFields(
       }
     } else if (vaultTagsChanged && !setsEqual(V_tags, O_tags)) {
       writeTagsToOF();
-    } else if (ofTagsChanged && !setsEqual(O_tags, V_tags)) {
-      writeTagsToVault();
     }
+    // ofTagsChanged-only: no vault write (tags are push-only).
   }
 }

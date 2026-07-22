@@ -102,7 +102,9 @@ export function buildUpdateBody(fields: Partial<TaskWriteFields>): Record<string
 
 /**
  * Adapter factory. Unwraps the `{success, data}` envelope; throws a clear Error (mentioning TaskNotes)
- * on `!ok` or `success === false`. getById returns null on a 404 / not-found.
+ * on `!ok` or `success === false`. getById returns null ONLY on a genuine 404 (task absent) or a
+ * success=false envelope; any other non-ok status (500, etc.) throws rather than masking a transient
+ * failure as "not found".
  */
 export function createTaskNotesAdapter(opts: TaskNotesAdapterOptions): TaskNotesAdapter {
   const { baseUrl, fetch, completedStatuses, authToken } = opts;
@@ -150,7 +152,13 @@ export function createTaskNotesAdapter(opts: TaskNotesAdapterOptions): TaskNotes
         method: "GET",
         headers: authHeaders(),
       });
-      if (!res.ok) return null;
+      if (!res.ok) {
+        // Only a genuine 404 means the task is absent -> null. Any other non-ok status (500, etc.)
+        // is a transient failure and must THROW: silently treating it as "not found" would make a
+        // de-surface candidate look absent and skip it (deleting/completing the wrong OF mirror).
+        if (res.status === 404) return null;
+        throw new Error(`TaskNotes: getById(${id}) failed with HTTP ${res.status}`);
+      }
       const envelope = await res.json() as { success: boolean; data?: RawTNTask };
       if (envelope.success === false) return null;
       return normalizeTNTask(envelope.data!, completedStatuses);
