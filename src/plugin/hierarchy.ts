@@ -31,12 +31,13 @@ export interface OFItem {
   children: OFItem[];
 }
 
-/** Optional sequencing inputs for buildOFForest (#8): which nodes are sequential + each task's blockers. */
+/** Optional sequencing inputs for buildOFForest (#8): each task's blockers + the parallel opt-out. */
 export interface ForestOptions {
-  /** True if the node id names a container the user marked sequential. */
-  isSequential?: (sourceId: string) => boolean;
-  /** The blocker task ids for a task id (its blockedBy), used to order a sequential container's children. */
+  /** The blocker task ids for a task id (its blockedBy). A container with an intra-container edge is
+   *  INFERRED sequential — no manual tag; the dependency data is the signal. */
   depsFor?: (sourceId: string) => string[];
+  /** True if the node id names a container the user forced parallel (opt-out) despite having deps. */
+  isForcedParallel?: (sourceId: string) => boolean;
 }
 
 /**
@@ -101,14 +102,24 @@ export function buildOFForest(
     }
 
     // #8: only project/task containers can be sequential (a folder holds projects, not ordered tasks).
-    // When sequential, order the direct children by their blockedBy dependencies (blockers first).
+    // INFER sequential from the data: a container with a blockedBy edge BETWEEN its own direct children
+    // is ordered, so it becomes a sequential container — no manual tag. The `omnifocus/parallel` opt-out
+    // forces it parallel anyway (e.g. partial deps where the independent siblings should stay available).
+    // When sequential, order the direct children by their dependencies (blockers first).
     const isContainer = type === "project" || type === "task";
-    const sequential = isContainer && (opts.isSequential?.(input.id) ?? false);
-    if (sequential && opts.depsFor) {
+    let sequential = false;
+    if (isContainer && opts.depsFor) {
       const depsFor = opts.depsFor;
-      const ordered = orderByDeps(children.map((c) => c.sourceId), depsFor);
-      const byId = new Map(children.map((c) => [c.sourceId, c]));
-      children = ordered.map((id) => byId.get(id)!);
+      const childIds = new Set(children.map((c) => c.sourceId));
+      const hasIntraDep = children.some((c) =>
+        depsFor(c.sourceId).some((d) => d !== c.sourceId && childIds.has(d)),
+      );
+      sequential = hasIntraDep && !(opts.isForcedParallel?.(input.id) ?? false);
+      if (sequential) {
+        const ordered = orderByDeps(children.map((c) => c.sourceId), depsFor);
+        const byId = new Map(children.map((c) => [c.sourceId, c]));
+        children = ordered.map((id) => byId.get(id)!);
+      }
     }
 
     return { sourceId: input.id, name: input.title, type, sequential, children };

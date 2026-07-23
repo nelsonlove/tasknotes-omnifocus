@@ -10,7 +10,7 @@ import {
   buildHasSubtasksFilter,
   buildProjectNodeInputs,
   computeIgnoredTitles,
-  computeSequentialIds,
+  computeParallelIds,
   pruneIgnored,
 } from "./discovery.js";
 import { buildOFForest, collectFolders, collectProjects, forestToCreateOps } from "./hierarchy.js";
@@ -270,8 +270,8 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         t.flagged = readFlagged(app, t.id, fieldKeys.flag);
         depsById.set(t.id, readBlockedBy(app, t.id));
       }
-      // #8: the ids of project-nodes the user marked sequential (per-container; not inherited).
-      const sequentialIds = computeSequentialIds(projectNodes, this.settings.sequentialTag);
+      // #8: sequencing is INFERRED from blockedBy edges; parallelIds are the opt-out (force parallel).
+      const parallelIds = computeParallelIds(projectNodes, this.settings.parallelTag);
       const depsFor = (id: string) => depsById.get(id) ?? [];
 
       // Drop ignored LEAF tasks (pruneIgnored only removes ignored project-node subtrees).
@@ -279,10 +279,10 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       const scoped = pruned.map((inp) => ({ ...inp, leafTaskIds: inp.leafTaskIds.filter((id) => !isIgnored(id)) }));
 
       // --- 2. Map subtree depth → OmniFocus folders / single-action projects / (nested) tasks. ---
-      // #8: mark sequential containers and order their children by blockedBy.
+      // #8: infer sequential containers from blockedBy edges (opt out via parallelIds) and order children.
       const forest = buildOFForest(scoped, (id) => taskById.get(id)?.title ?? id, levels, {
-        isSequential: (id) => sequentialIds.has(id),
         depsFor,
+        isForcedParallel: (id) => parallelIds.has(id),
       });
       const folders = collectFolders(forest);
       const projects = collectProjects(forest);

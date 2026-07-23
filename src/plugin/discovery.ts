@@ -180,15 +180,16 @@ export function buildProjectNodeInputs(
  * test/discovery.test.ts.
  */
 /**
- * The ids of project-nodes (containers) marked sequential via `sequentialTag` (#8). Unlike the ignore
- * tag, this is NOT inherited down the subtree — sequencing is a per-container property, so only a node
- * that itself carries the tag becomes a sequential OmniFocus container. Returns the marked node ids.
+ * The ids of project-nodes forced PARALLEL via `parallelTag` (#8) — the opt-out from inferred sequencing.
+ * A container with a blockedBy edge among its children is inferred sequential; tagging it keeps it
+ * parallel/single-action anyway (for partial-dependency containers whose independent siblings should stay
+ * available). Per-container, not inherited. Returns the tagged node ids.
  */
-export function computeSequentialIds(projectNodes: TaskNote[], sequentialTag: string): Set<string> {
+export function computeParallelIds(projectNodes: TaskNote[], parallelTag: string): Set<string> {
   const ids = new Set<string>();
-  if (!sequentialTag) return ids;
+  if (!parallelTag) return ids;
   for (const node of projectNodes) {
-    if (node.tags.includes(sequentialTag)) ids.add(node.id);
+    if (node.tags.includes(parallelTag)) ids.add(node.id);
   }
   return ids;
 }
