@@ -623,3 +623,24 @@ describe("flagged (bidirectional, decoupled from priority)", () => {
     expect(plan.mutations).toHaveLength(0);
   });
 });
+
+// =====================================================================
+describe("configurable userField mappings — disable switch (#10)", () => {
+  it("syncDefer:false drops the deferred field (no OF defer write on push)", () => {
+    const base = converged({ t: { deferred: "2026-07-17T00:00:00.000Z" }, o: { deferDate: null } });
+    const enabled = reconcile({ ...base, direction: "push" });
+    expect(byKind(enabled, "updateOFTask")[0]?.fields.deferDate).toBe("2026-07-17T00:00:00.000Z");
+
+    const disabled = reconcile({ ...base, direction: "push", config: { ...cfg, syncDefer: false } });
+    expect(byKind(disabled, "updateOFTask")).toHaveLength(0);
+  });
+
+  it("syncFlag:false drops the flagged field (no OF flag write on push)", () => {
+    const base = converged({ t: { flagged: true }, o: { flagged: false } });
+    const enabled = reconcile({ ...base, direction: "push" });
+    expect(byKind(enabled, "updateOFTask")[0]?.fields.flagged).toBe(true);
+
+    const disabled = reconcile({ ...base, direction: "push", config: { ...cfg, syncFlag: false } });
+    expect(byKind(disabled, "updateOFTask")).toHaveLength(0);
+  });
+});

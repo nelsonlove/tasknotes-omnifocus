@@ -31,6 +31,16 @@ export interface TaskNotesOmnifocusSettings {
   authToken?: string;
   /** Vault folder where OmniFocus inbox tasks are captured as new TaskNotes. Blank = disabled. */
   inboxDestination: string;
+  /**
+   * Frontmatter/userField key for the deferred date (mapped to OmniFocus defer date). Default "deferred";
+   * blank disables the deferred⇄defer mapping entirely. Must match a TaskNotes date userField. (#10)
+   */
+  deferField: string;
+  /**
+   * Frontmatter/userField key for the flagged boolean (mapped to the OmniFocus flag). Default "flagged";
+   * blank disables the flagged⇄flag mapping entirely. Must match a TaskNotes boolean userField. (#10)
+   */
+  flagField: string;
 }
 
 export const DEFAULT_SETTINGS: TaskNotesOmnifocusSettings = {
@@ -57,6 +67,8 @@ export const DEFAULT_SETTINGS: TaskNotesOmnifocusSettings = {
   reopenStatus: "open",
   completedStatuses: ["done"],
   inboxDestination: "",
+  deferField: "deferred",
+  flagField: "flagged",
 };
 
 export class SettingTab extends PluginSettingTab {
@@ -210,6 +222,36 @@ export class SettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.inboxDestination)
           .onChange(async (value) => {
             this.plugin.settings.inboxDestination = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Deferred field key")
+      .setDesc(
+        "Frontmatter key of the TaskNotes date userField mapped to the OmniFocus defer date. Blank disables the deferred⇄defer mapping. A run warns if this key isn't a registered TaskNotes date userField.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("deferred")
+          .setValue(this.plugin.settings.deferField)
+          .onChange(async (value) => {
+            this.plugin.settings.deferField = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Flagged field key")
+      .setDesc(
+        "Frontmatter key of the TaskNotes boolean userField mapped to the OmniFocus flag. Blank disables the flagged⇄flag mapping. A run warns if this key isn't a registered TaskNotes boolean userField.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("flagged")
+          .setValue(this.plugin.settings.flagField)
+          .onChange(async (value) => {
+            this.plugin.settings.flagField = value.trim();
             await this.plugin.saveSettings();
           }),
       );

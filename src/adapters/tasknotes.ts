@@ -31,6 +31,8 @@ export interface TaskNotesAdapterOptions {
   /** Status values considered completed (derives TaskNote.isCompleted). */
   completedStatuses: string[];
   authToken?: string;
+  /** Configurable keys for the deferred/flagged userFields; the PUT body must use the user's key. (#10) */
+  fieldKeys?: UserFieldKeys;
   /**
    * Sync-safe fallback for the per-task PUT route. The TaskNotes `/api/tasks/:id` route returns a 404 —
    * or a 2xx with an empty body — for notes living in software-project task dirs (`…/Tasks/`, `…/issues/`,
@@ -90,21 +92,35 @@ export function normalizeTNTask(raw: RawTNTask, completedStatuses: string[]): Ta
   };
 }
 
+/** Configurable frontmatter/API keys for the deferred + flagged userFields (#10). */
+export interface UserFieldKeys {
+  /** API/frontmatter key for the deferred date. Default "deferred"; blank omits the field. */
+  defer?: string;
+  /** API/frontmatter key for the flagged boolean. Default "flagged"; blank omits the field. */
+  flag?: string;
+}
+
 /**
  * Build the PUT body from core TaskWriteFields (only keys present in `fields`):
- *  title->title, due->due, scheduled->scheduled, deferred->deferred, timeEstimate->timeEstimate,
- *  flagged->flagged, tags->tags,
+ *  title->title, due->due, scheduled->scheduled, deferred-><deferKey>, timeEstimate->timeEstimate,
+ *  flagged-><flagKey>, tags->tags,
  *  priority-> the TaskNotes priority string ("none"|"low"|"normal"|"high", symmetric with mapTNPriority).
- *  (deferred and flagged are TaskNotes userFields; verified the REST API accepts and echoes them.)
+ *  deferred and flagged are TaskNotes userFields whose keys are configurable (#10) — the body key must
+ *  match the user's registered userField key. Defaults are "deferred"/"flagged"; a blank key omits it.
  */
-export function buildUpdateBody(fields: Partial<TaskWriteFields>): Record<string, unknown> {
+export function buildUpdateBody(
+  fields: Partial<TaskWriteFields>,
+  fieldKeys?: UserFieldKeys,
+): Record<string, unknown> {
+  const deferKey = fieldKeys?.defer ?? "deferred";
+  const flagKey = fieldKeys?.flag ?? "flagged";
   const body: Record<string, unknown> = {};
   if ("title" in fields) body.title = fields.title;
   if ("due" in fields) body.due = fields.due;
   if ("scheduled" in fields) body.scheduled = fields.scheduled;
-  if ("deferred" in fields) body.deferred = fields.deferred;
+  if ("deferred" in fields && deferKey) body[deferKey] = fields.deferred;
   if ("timeEstimate" in fields) body.timeEstimate = fields.timeEstimate;
-  if ("flagged" in fields) body.flagged = fields.flagged;
+  if ("flagged" in fields && flagKey) body[flagKey] = fields.flagged;
   if ("tags" in fields) body.tags = fields.tags;
   if ("priority" in fields) body.priority = fields.priority; // "none"|"low"|"normal"|"high" pass through
   return body;
@@ -117,7 +133,7 @@ export function buildUpdateBody(fields: Partial<TaskWriteFields>): Record<string
  * failure as "not found".
  */
 export function createTaskNotesAdapter(opts: TaskNotesAdapterOptions): TaskNotesAdapter {
-  const { baseUrl, fetch, completedStatuses, authToken, frontmatterFallback } = opts;
+  const { baseUrl, fetch, completedStatuses, authToken, fieldKeys, frontmatterFallback } = opts;
 
   function authHeaders(): Record<string, string> {
     const headers: Record<string, string> = {};
@@ -202,7 +218,7 @@ export function createTaskNotesAdapter(opts: TaskNotesAdapterOptions): TaskNotes
     },
 
     async update(id: string, fields: Partial<TaskWriteFields>): Promise<void> {
-      await putTask(id, buildUpdateBody(fields), "update");
+      await putTask(id, buildUpdateBody(fields, fieldKeys), "update");
     },
 
     async setStatus(id: string, status: string): Promise<void> {

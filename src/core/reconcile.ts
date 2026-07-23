@@ -382,7 +382,15 @@ function reconcileScalarFields(
     },
   ];
 
-  for (const { field, V, O, S, writeToOF, writeToVault } of scalarFieldDefs) {
+  // #10: a disabled userField mapping (blank deferField/flagField) drops that scalar entirely — never
+  // read, never written either way — so a null vault value can't push a spurious clear to OmniFocus.
+  const activeFieldDefs = scalarFieldDefs.filter((d) => {
+    if (d.field === "deferred") return config.syncDefer !== false;
+    if (d.field === "flagged") return config.syncFlag !== false;
+    return true;
+  });
+
+  for (const { field, V, O, S, writeToOF, writeToVault } of activeFieldDefs) {
     const res = resolveScalarField({ V, O, S, hasSnap: !!snap, direction, config, field, linkId });
     if ("writeProject" in res) writeToOF(res.writeProject);
     if ("writeVault" in res) writeToVault(res.writeVault);

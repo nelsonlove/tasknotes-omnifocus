@@ -28,20 +28,24 @@ export function readDescription(app: App, path: string): string | null {
 }
 
 /**
- * The `deferred` frontmatter date (TaskNotes userField), or null. The `/query` API does not return
- * userFields, so the plugin reads it from the metadata cache (same pattern as `description`).
+ * The deferred-date frontmatter value (a TaskNotes userField), or null. The `/query` API does not return
+ * userFields, so the plugin reads it from the metadata cache (same pattern as `description`). The
+ * frontmatter key is configurable (#10); a blank key disables the mapping and always returns null.
  */
-export function readDeferred(app: App, path: string): string | null {
-  const v = frontmatter(app, path)?.["deferred"];
+export function readDeferred(app: App, path: string, key = "deferred"): string | null {
+  if (!key) return null;
+  const v = frontmatter(app, path)?.[key];
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
 /**
- * The `flagged` frontmatter boolean (TaskNotes userField), defaulting to false when absent/non-boolean.
- * Read from the metadata cache since `/query` does not return userFields.
+ * The flagged-boolean frontmatter value (a TaskNotes userField), defaulting to false when absent/non-
+ * boolean. Read from the metadata cache since `/query` does not return userFields. The frontmatter key is
+ * configurable (#10); a blank key disables the mapping and always returns false.
  */
-export function readFlagged(app: App, path: string): boolean {
-  return frontmatter(app, path)?.["flagged"] === true;
+export function readFlagged(app: App, path: string, key = "flagged"): boolean {
+  if (!key) return false;
+  return frontmatter(app, path)?.[key] === true;
 }
 
 /** The note body (content below the frontmatter block), trimmed, or null if empty/missing. */

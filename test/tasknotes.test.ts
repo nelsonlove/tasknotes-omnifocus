@@ -128,6 +128,16 @@ describe("buildUpdateBody", () => {
       scheduled: "2026-07-18T00:00:00.000Z",
     });
   });
+
+  it("emits the configured userField keys for deferred/flagged (#10)", () => {
+    expect(
+      buildUpdateBody({ deferred: "2026-07-17T00:00:00.000Z", flagged: true }, { defer: "deferDate", flag: "isFlagged" }),
+    ).toEqual({ deferDate: "2026-07-17T00:00:00.000Z", isFlagged: true });
+  });
+
+  it("omits a userField when its configured key is blank (mapping disabled) (#10)", () => {
+    expect(buildUpdateBody({ deferred: "2026-07-17T00:00:00.000Z", flagged: true }, { defer: "", flag: "" })).toEqual({});
+  });
 });
 
 describe("adapter.query", () => {

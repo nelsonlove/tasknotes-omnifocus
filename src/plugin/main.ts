@@ -17,6 +17,7 @@ import { validateHierarchyLevels, DEFAULT_HIERARCHY_LEVELS } from "./levels.js";
 import type { OFLevelType } from "./levels.js";
 import { readOmnifocusUrl, readDescription, readBody, readDeferred, readFlagged, writeOmnifocusUrl, clearOmnifocusUrl, writeTaskFrontmatter } from "./frontmatter.js";
 import { RunLog } from "./runlog.js";
+import { validateUserField } from "./userfields.js";
 import { sanitizeFilename, filterUncaptured, buildCaptureFrontmatter } from "./inbox.js";
 import { createTaskNotesAdapter } from "../adapters/tasknotes.js";
 import { createOmniFocusAdapter, defaultRunOmniJS } from "../adapters/omnifocus.js";
@@ -84,7 +85,20 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       doneStatus: s.doneStatus,
       reopenStatus: s.reopenStatus,
       obsidianVault: this.app.vault.getName(),
+      // #10: a blank field key disables that userField mapping entirely (not read, not reconciled).
+      syncDefer: s.deferField.trim() !== "",
+      syncFlag: s.flagField.trim() !== "",
     };
+  }
+
+  /**
+   * TaskNotes' registered userFields (array of { id, key, displayName, type }), read live from its own
+   * settings (same access pattern as `taskNotesMarkerTags()`). Returns undefined if TaskNotes is absent
+   * or exposes no userFields; the validator degrades gracefully (no false warnings) on an odd shape. (#10)
+   */
+  private taskNotesUserFields(): unknown {
+    return (this.app as unknown as { plugins?: { plugins?: Record<string, { settings?: Record<string, unknown> }> } })
+      .plugins?.plugins?.["tasknotes"]?.settings?.["userFields"];
   }
 
   /**
@@ -161,6 +175,8 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         },
         completedStatuses: this.settings.completedStatuses,
         authToken: this.settings.authToken,
+        // #10: the PUT body must use the user's configured userField keys, not the hardcoded defaults.
+        fieldKeys: { defer: this.settings.deferField, flag: this.settings.flagField },
         // #11: notes in software-project task dirs (…/Tasks/, …/issues/) 404 on the per-task PUT route,
         // so field-reconcile writes to them would be lost. Re-route those through Obsidian's frontmatter
         // API (sync-safe) with the same body, and log that the fallback fired.
@@ -173,6 +189,19 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       const app = this.app;
       const ignoreTag = this.settings.ignoreTag;
       log.line(`direction=${direction} dryRun=${dryRun} vault=${config.obsidianVault}`);
+
+      // #10: warn (don't block) if a configured userField key isn't a matching TaskNotes userField —
+      // catches "set the field name but never created the userField" and type mismatches.
+      const userFields = this.taskNotesUserFields();
+      for (const w of [
+        validateUserField(userFields, this.settings.deferField.trim(), "date", "deferred"),
+        validateUserField(userFields, this.settings.flagField.trim(), "boolean", "flagged"),
+      ]) {
+        if (w) {
+          log.line(`[userfield] WARNING: ${w}`);
+          new Notice(`TaskNotes⇄OmniFocus: ${w}`);
+        }
+      }
 
       // Validate the configurable depth→type map; fall back to the default on a bad config.
       let levels: OFLevelType[] = this.settings.hierarchyLevels;
@@ -199,8 +228,9 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         t.body = await readBody(app, t.id);
         // `deferred` and `flagged` are TaskNotes userFields the /query API doesn't return — read from
         // the metadata cache (same as description/omnifocusUrl) so reconcile sees the real vault values.
-        t.deferred = readDeferred(app, t.id);
-        t.flagged = readFlagged(app, t.id);
+        // Keys are configurable (#10); a blank key returns null/false (mapping disabled).
+        t.deferred = readDeferred(app, t.id, this.settings.deferField);
+        t.flagged = readFlagged(app, t.id, this.settings.flagField);
       }
 
       // Drop ignored LEAF tasks (pruneIgnored only removes ignored project-node subtrees).
