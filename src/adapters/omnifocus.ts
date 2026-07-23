@@ -36,7 +36,11 @@ export type OFOp =
   | { op: "delete"; primaryKey: string }
   // "enrich" a PROJECT's own root-task fields (due/defer/flag/note/completion). primaryKey is the
   // project's primaryKey. Completion maps to Project.Status (Done/Active); name/tags are not written.
-  | { op: "updateProject"; primaryKey: string; fields: Partial<OFWriteFields> };
+  | { op: "updateProject"; primaryKey: string; fields: Partial<OFWriteFields> }
+  // #8: reorder the direct children of a sequential container into `orderedPrimaryKeys` order (blockers
+  // first). The container is a project (by `project` name) or an action-group task (by `parentPrimaryKey`).
+  // Idempotent: moving children into the order they already hold is a no-op.
+  | { op: "reorder"; project?: string; parentPrimaryKey?: string; orderedPrimaryKeys: string[] };
 
 export interface BatchResult {
   /** create `ref` (caller correlation id, e.g. taskId) -> new primaryKey */
@@ -58,6 +62,12 @@ export interface ProjectSpec {
   folderPath: string[];
   /** When true, mark the project a single-action list (`containsSingletonActions = true`). Idempotent. */
   singleActionList?: boolean;
+  /**
+   * #8: when true, mark the project SEQUENTIAL (`sequential = true`, and clear `containsSingletonActions`
+   * since the two are mutually exclusive). Idempotent. `sequential` and `singleActionList` should not
+   * both be set for one project — the plugin sends one or the other.
+   */
+  sequential?: boolean;
 }
 
 export interface ScaffoldResult {
@@ -317,8 +327,9 @@ export function buildBatchScript(ops: OFOp[]): string {
           newTask = new Task(op.fields.name || 'Untitled', proj.ending);
         }
         setTaskFields(newTask, op.fields);
-        // A task with children is an action group; sequential:false makes it parallel.
+        // A task with children is an action group; sequential:false makes it parallel, true serial (#8).
         if (op.sequential === false) { newTask.sequential = false; }
+        else if (op.sequential === true) { newTask.sequential = true; }
         if (op.fields.completed) { newTask.markComplete(); }
         refMap[op.ref] = newTask;
         result.created[op.ref] = newTask.id.primaryKey;
@@ -353,6 +364,24 @@ export function buildBatchScript(ops: OFOp[]): string {
         if (op.fields.completed === true) { proj.status = Project.Status.Done; }
         else if (op.fields.completed === false) { proj.status = Project.Status.Active; }
         result.updated.push(op.primaryKey);
+      } else if (op.op === 'reorder') {
+        // #8: move the named children, in order, to the end of their container — final order matches
+        // orderedPrimaryKeys (blockers first). Container is an action-group task or a project.
+        var container;
+        if (op.parentPrimaryKey) {
+          container = Task.byIdentifier(op.parentPrimaryKey);
+        } else {
+          container = flattenedProjects.find(function (p) { return p.name === op.project; });
+        }
+        if (!container) {
+          result.errors.push({ primaryKey: op.parentPrimaryKey || op.project, message: 'Reorder container not found: ' + (op.parentPrimaryKey || op.project) });
+          continue;
+        }
+        for (var r = 0; r < op.orderedPrimaryKeys.length; r++) {
+          var childTask = Task.byIdentifier(op.orderedPrimaryKeys[r]);
+          if (childTask) { moveTasks([childTask], container.ending); }
+        }
+        result.updated.push(op.parentPrimaryKey || op.project);
       }
     } catch (e) {
       var errEntry = { message: String(e) };
@@ -461,8 +490,12 @@ export function buildScaffoldScript(folders: FolderSpec[], projects: ProjectSpec
         }
         result.createdProjects.push(projSpec.title);
       }
-      // Idempotently mark single-action lists (whether newly created or reused).
-      if (projSpec.singleActionList && proj.containsSingletonActions !== true) {
+      // Idempotently set the project type (whether newly created or reused). A sequential project (#8)
+      // and a single-action list are mutually exclusive; sequential clears containsSingletonActions.
+      if (projSpec.sequential) {
+        if (proj.containsSingletonActions !== false) { proj.containsSingletonActions = false; }
+        if (proj.sequential !== true) { proj.sequential = true; }
+      } else if (projSpec.singleActionList && proj.containsSingletonActions !== true) {
         proj.containsSingletonActions = true;
       }
     } catch (e) {

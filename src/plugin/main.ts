@@ -10,12 +10,13 @@ import {
   buildHasSubtasksFilter,
   buildProjectNodeInputs,
   computeIgnoredTitles,
+  computeSequentialIds,
   pruneIgnored,
 } from "./discovery.js";
 import { buildOFForest, collectFolders, collectProjects, forestToCreateOps } from "./hierarchy.js";
 import { validateHierarchyLevels, DEFAULT_HIERARCHY_LEVELS } from "./levels.js";
 import type { OFLevelType } from "./levels.js";
-import { readOmnifocusUrl, readDescription, readBody, readDeferred, readFlagged, writeOmnifocusUrl, clearOmnifocusUrl, writeTaskFrontmatter } from "./frontmatter.js";
+import { readOmnifocusUrl, readDescription, readBody, readDeferred, readFlagged, readBlockedBy, writeOmnifocusUrl, clearOmnifocusUrl, writeTaskFrontmatter } from "./frontmatter.js";
 import { RunLog } from "./runlog.js";
 import { validateUserField, resolveFieldKey } from "./userfields.js";
 import { sanitizeFilename, filterUncaptured, buildCaptureFrontmatter } from "./inbox.js";
@@ -255,6 +256,9 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       const taskById = new Map<string, TaskNote>();
       for (const n of projectNodes) taskById.set(n.id, n);
       for (const [id, t] of leafById) taskById.set(id, t);
+      // #8: each task's blockedBy dependencies (resolved to task ids), used to order a sequential
+      // container's children. Read alongside the other frontmatter-only fields.
+      const depsById = new Map<string, string[]>();
       for (const t of filterIgnored([...taskById.values()], ignoreTag)) {
         t.description = readDescription(app, t.id);
         t.omnifocusUrl = readOmnifocusUrl(app, t.id);
@@ -264,14 +268,22 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         // Keys are configurable (#10); a blank/disabled key returns null/false (mapping disabled).
         t.deferred = readDeferred(app, t.id, fieldKeys.defer);
         t.flagged = readFlagged(app, t.id, fieldKeys.flag);
+        depsById.set(t.id, readBlockedBy(app, t.id));
       }
+      // #8: the ids of project-nodes the user marked sequential (per-container; not inherited).
+      const sequentialIds = computeSequentialIds(projectNodes, this.settings.sequentialTag);
+      const depsFor = (id: string) => depsById.get(id) ?? [];
 
       // Drop ignored LEAF tasks (pruneIgnored only removes ignored project-node subtrees).
       const isIgnored = (id: string) => (taskById.get(id)?.tags ?? []).includes(ignoreTag);
       const scoped = pruned.map((inp) => ({ ...inp, leafTaskIds: inp.leafTaskIds.filter((id) => !isIgnored(id)) }));
 
       // --- 2. Map subtree depth → OmniFocus folders / single-action projects / (nested) tasks. ---
-      const forest = buildOFForest(scoped, (id) => taskById.get(id)?.title ?? id, levels);
+      // #8: mark sequential containers and order their children by blockedBy.
+      const forest = buildOFForest(scoped, (id) => taskById.get(id)?.title ?? id, levels, {
+        isSequential: (id) => sequentialIds.has(id),
+        depsFor,
+      });
       const folders = collectFolders(forest);
       const projects = collectProjects(forest);
       log.line(`discover: ${projectNodes.length} project-nodes, ${childTasks.length} child-tasks`);
@@ -387,12 +399,14 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         return;
       }
 
-      // --- 3. Ensure the folder/project skeleton (projects are single-action lists). ---
+      // --- 3. Ensure the folder/project skeleton (projects are single-action lists, unless marked
+      //        sequential (#8), which is mutually exclusive with a single-action list). ---
       const folderSpecs: FolderSpec[] = folders.map((f) => ({ path: [...f.path, f.name] }));
       const projectSpecs: ProjectSpec[] = projects.map((p) => ({
         title: p.name,
         folderPath: p.folderPath,
-        singleActionList: true,
+        singleActionList: !p.sequential,
+        sequential: p.sequential,
       }));
       const scaffold = await omnifocus.ensureStructure(folderSpecs, projectSpecs);
       let created = 0;
@@ -568,6 +582,44 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         }
       }
       log.line(`field-reconcile TOTAL: ${fieldApplied} applied, ${fieldConflicts} conflicts`);
+
+      // --- 6b. Sequential ordering (#8): for each container marked sequential, move its direct children
+      //         into blockedBy order (blockers first). Push-authoritative, so pull is skipped. Emitted
+      //         only when the container actually has an intra-container dependency edge (else ordering is
+      //         arbitrary — no churn). Children are already dep-ordered in the forest; we map them to the
+      //         linked primaryKeys and issue one reorder op per container. OF→vault reorder is phase 2.
+      if (direction !== "pull") {
+        const reorderOps: OFOp[] = [];
+        const pkOf = (id: string) => this.store.getPrimaryKey(id);
+        const emitReorder = (children: import("./hierarchy.js").OFItem[], addr: { project?: string; parentPrimaryKey?: string }) => {
+          const taskChildren = children.filter((c) => c.type === "task");
+          if (taskChildren.length < 2) return;
+          const childIds = new Set(taskChildren.map((c) => c.sourceId));
+          const hasDep = taskChildren.some((c) => depsFor(c.sourceId).some((d) => d !== c.sourceId && childIds.has(d)));
+          if (!hasDep) return; // no ordering constraint among these siblings — leave them be
+          const pks = taskChildren.map((c) => pkOf(c.sourceId)).filter((pk): pk is string => pk != null);
+          if (pks.length < 2) return;
+          reorderOps.push({ op: "reorder", ...addr, orderedPrimaryKeys: pks });
+        };
+        for (const proj of projects) {
+          if (proj.sequential) emitReorder(proj.tasks, { project: proj.name });
+          const walkSeq = (items: import("./hierarchy.js").OFItem[]): void => {
+            for (const it of items) {
+              if (it.type === "task" && it.sequential && it.children.length > 0) {
+                const pk = pkOf(it.sourceId);
+                if (pk) emitReorder(it.children, { parentPrimaryKey: pk });
+              }
+              walkSeq(it.children);
+            }
+          };
+          walkSeq(proj.tasks);
+        }
+        if (reorderOps.length) {
+          const br = await omnifocus.applyBatch(reorderOps);
+          errors += br.errors.length;
+          log.line(`sequential: ${reorderOps.length} container(s) reordered by blockedBy, ${br.errors.length} errors`);
+        }
+      }
 
       // --- 7. Inbox capture: pull OmniFocus INBOX tasks (no containing project) into the vault as new
       //        TaskNotes, in the user-configured destination folder. Runs only on pull/sync and only

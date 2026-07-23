@@ -195,6 +195,24 @@ describe("buildReadScript / buildBatchScript", () => {
     expect(script).toContain("new Folder");
     expect(script).toContain("new Project");
   });
+
+  it("batch script sets a sequential action group and handles the reorder op (#8)", () => {
+    const ops: OFOp[] = [
+      { op: "create", ref: "g", project: "P", sequential: true, fields: writeFields({ name: "Group" }) },
+      { op: "reorder", project: "P", orderedPrimaryKeys: ["pk2", "pk1"] },
+    ];
+    const script = buildBatchScript(ops);
+    expect(script).toContain(encodePayload(ops));
+    // sets sequential true for a marked group, and moves children via moveTasks for reorder
+    expect(script).toContain("newTask.sequential = true");
+    expect(script).toContain("moveTasks");
+  });
+
+  it("scaffold script makes a sequential project (not a single-action list) (#8)", () => {
+    const script = buildScaffoldScript([], [{ title: "SeqP", folderPath: [], sequential: true }]);
+    expect(script).toContain("proj.sequential = true");
+    expect(script).toContain("containsSingletonActions = false");
+  });
 });
 
 describe("buildReadAllProjectsScript", () => {

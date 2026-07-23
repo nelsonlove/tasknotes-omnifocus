@@ -224,3 +224,45 @@ describe("robustness", () => {
     expect(findContainmentAnomalies(buildOFForest(FIXTURE, leafName, DEFAULT))).toEqual([]);
   });
 });
+
+// =====================================================================
+describe("sequential containers + blockedBy ordering (#8)", () => {
+  // Cat marked sequential; deps among its direct children (B, C, Task A):
+  //   a.md blockedBy c.md, b.md blockedBy a.md  →  order C, Task A, B
+  const seq = new Set(["cat.md"]);
+  const depMap: Record<string, string[]> = { "a.md": ["c.md"], "b.md": ["a.md"] };
+  const forest = buildOFForest(FIXTURE, leafName, DEFAULT, {
+    isSequential: (id) => seq.has(id),
+    depsFor: (id) => depMap[id] ?? [],
+  });
+
+  it("marks the container sequential and leaves others parallel", () => {
+    expect(find(forest, "Cat")!.sequential).toBe(true);
+    expect(find(forest, "B")!.sequential).toBe(false);
+    expect(find(forest, "Area")!.sequential).toBe(false); // folders never sequential
+  });
+
+  it("orders the sequential container's direct children by blockedBy (blockers first)", () => {
+    expect(find(forest, "Cat")!.children.map((c) => c.name)).toEqual(["C", "Task A", "B"]);
+  });
+
+  it("collectProjects surfaces the sequential flag", () => {
+    const proj = collectProjects(forest).find((p) => p.name === "Cat")!;
+    expect(proj.sequential).toBe(true);
+  });
+
+  it("forestToCreateOps marks a sequential action group's create op sequential:true", () => {
+    // Mark the action group B sequential instead; its create op should carry sequential:true.
+    const f2 = buildOFForest(FIXTURE, leafName, DEFAULT, { isSequential: (id) => id === "b.md", depsFor: () => [] });
+    const proj = collectProjects(f2).find((p) => p.name === "Cat")!;
+    const fields = (): OFWriteFields => ({
+      name: "x", note: null, dueDate: null, deferDate: null, plannedDate: null,
+      estimatedMinutes: null, flagged: false, tags: [], completed: false,
+    });
+    const ops = forestToCreateOps("Cat", proj.tasks, fields);
+    const bOp = ops.find((o) => o.op === "create" && o.ref === "b.md");
+    expect(bOp && "sequential" in bOp && bOp.sequential).toBe(true);
+    const cOp = ops.find((o) => o.op === "create" && o.ref === "c.md");
+    expect(cOp && "sequential" in cOp && cOp.sequential).toBe(false); // unmarked group stays parallel
+  });
+});

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { App } from "obsidian";
-import { readBody, readDeferred, readFlagged } from "../src/plugin/frontmatter.js";
+import { readBody, readDeferred, readFlagged, readBlockedBy } from "../src/plugin/frontmatter.js";
 
 // Minimal App mock: readBody only touches vault.getAbstractFileByPath + vault.cachedRead, and treats
 // anything with an `extension` as a TFile.
@@ -64,5 +64,45 @@ describe("readDeferred / readFlagged — configurable keys (#10)", () => {
     const app = mockAppFM({ deferred: "2026-07-17", flagged: true });
     expect(readDeferred(app, "note.md", "")).toBeNull();
     expect(readFlagged(app, "note.md", "")).toBe(false);
+  });
+});
+
+// App mock exposing frontmatter + wikilink resolution.
+function mockAppLinks(fm: Record<string, unknown>, resolve: Record<string, string>): App {
+  const file = { extension: "md", path: "note.md" };
+  return {
+    vault: { getAbstractFileByPath: (p: string) => (p === "note.md" ? file : null) },
+    metadataCache: {
+      getFileCache: () => ({ frontmatter: fm }),
+      getFirstLinkpathDest: (link: string) => (resolve[link] ? { path: resolve[link] } : null),
+    },
+  } as unknown as App;
+}
+
+describe("readBlockedBy (#8)", () => {
+  it("resolves { uid: [[link]] } entries to vault task paths", () => {
+    const app = mockAppLinks(
+      { blockedBy: [{ uid: "[[Finish scanning]]", reltype: "FINISHTOSTART" }, { uid: "[[Audit]]" }] },
+      { "Finish scanning": "dir/Finish scanning.md", Audit: "dir/Audit.md" },
+    );
+    expect(readBlockedBy(app, "note.md")).toEqual(["dir/Finish scanning.md", "dir/Audit.md"]);
+  });
+
+  it("drops an alias and unresolvable links, dedupes", () => {
+    const app = mockAppLinks(
+      { blockedBy: [{ uid: "[[Blocker|shown as]]" }, { uid: "[[Missing]]" }, { uid: "[[Blocker]]" }] },
+      { Blocker: "dir/Blocker.md" },
+    );
+    expect(readBlockedBy(app, "note.md")).toEqual(["dir/Blocker.md"]);
+  });
+
+  it("keeps a bare (non-wikilink) path as-is", () => {
+    const app = mockAppLinks({ blockedBy: ["dir/Plain.md"] }, {});
+    expect(readBlockedBy(app, "note.md")).toEqual(["dir/Plain.md"]);
+  });
+
+  it("returns [] when blockedBy is absent or not a list", () => {
+    expect(readBlockedBy(mockAppLinks({}, {}), "note.md")).toEqual([]);
+    expect(readBlockedBy(mockAppLinks({ blockedBy: "nope" }, {}), "note.md")).toEqual([]);
   });
 });

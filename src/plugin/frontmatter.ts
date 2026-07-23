@@ -48,6 +48,41 @@ export function readFlagged(app: App, path: string, key = "flagged"): boolean {
   return frontmatter(app, path)?.[key] === true;
 }
 
+/** Strip a `[[wikilink]]` (or `[[link|alias]]`) down to its link target; return a non-link string as-is. */
+function wikilinkTarget(ref: string): { link: string; wasLink: boolean } {
+  const m = ref.match(/^\[\[([^\]]+)\]\]$/);
+  if (!m) return { link: ref, wasLink: false };
+  const inner = m[1].split("|")[0].trim(); // drop a display alias
+  return { link: inner, wasLink: true };
+}
+
+/**
+ * The task's `blockedBy` dependencies (#8), resolved to vault task paths. TaskNotes stores blockedBy as
+ * a list of `{ uid: "[[link]]", reltype }` entries (or, in older data, bare strings). Each uid wikilink
+ * is resolved against the vault via metadataCache; unresolvable links are dropped, a bare path is kept
+ * as-is. Returns the deduped list of blocker task ids (paths). Used only to ORDER children within a
+ * container the user marked sequential — cross-container blockers are ignored downstream.
+ */
+export function readBlockedBy(app: App, path: string): string[] {
+  const raw = frontmatter(app, path)?.["blockedBy"];
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const entry of raw) {
+    const ref =
+      typeof entry === "string"
+        ? entry
+        : entry && typeof entry === "object"
+          ? (entry as { uid?: unknown }).uid
+          : undefined;
+    if (typeof ref !== "string" || !ref) continue;
+    const { link, wasLink } = wikilinkTarget(ref);
+    const dest = app.metadataCache.getFirstLinkpathDest?.(link, path) as TFile | null | undefined;
+    if (dest?.path) out.push(dest.path);
+    else if (!wasLink) out.push(link); // a bare, already-resolved path
+  }
+  return [...new Set(out)];
+}
+
 /** The note body (content below the frontmatter block), trimmed, or null if empty/missing. */
 export async function readBody(app: App, path: string): Promise<string | null> {
   const f = fileFor(app, path);

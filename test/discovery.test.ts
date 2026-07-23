@@ -4,6 +4,7 @@ import {
   buildHasSubtasksFilter,
   buildProjectNodeInputs,
   computeIgnoredTitles,
+  computeSequentialIds,
   extractProjectTitles,
   noteKey,
   pruneIgnored,
@@ -176,6 +177,23 @@ describe("computeIgnoredTitles", () => {
     const X = withProjects(tn({ id: "X.md", title: "X" }), ["[[Y]]"]);
     const Y = withProjects(tn({ id: "Y.md", title: "Y" }), ["[[X]]"]);
     expect(() => computeIgnoredTitles([X, Y], "omnifocus/ignore")).not.toThrow();
+  });
+});
+
+describe("computeSequentialIds (#8)", () => {
+  const P = withProjects(tn({ id: "P.md", title: "P", tags: ["omnifocus/sequential"] }), []);
+  const C = withProjects(tn({ id: "C.md", title: "C" }), ["[[P]]"]); // child of marked P — NOT inherited
+  const Q = withProjects(tn({ id: "Q.md", title: "Q" }), []);
+
+  it("marks only nodes that themselves carry the tag (no subtree inheritance)", () => {
+    const ids = computeSequentialIds([P, C, Q], "omnifocus/sequential");
+    expect(ids.has("P.md")).toBe(true);
+    expect(ids.has("C.md")).toBe(false); // child does not inherit
+    expect(ids.has("Q.md")).toBe(false);
+  });
+
+  it("returns an empty set for a blank tag", () => {
+    expect(computeSequentialIds([P], "").size).toBe(0);
   });
 });
 

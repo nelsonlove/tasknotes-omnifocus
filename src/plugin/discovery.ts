@@ -179,6 +179,20 @@ export function buildProjectNodeInputs(
  * `ignoreTag`. Cycle-guarded. Returns the set of ignored node KEYS. Implement to satisfy
  * test/discovery.test.ts.
  */
+/**
+ * The ids of project-nodes (containers) marked sequential via `sequentialTag` (#8). Unlike the ignore
+ * tag, this is NOT inherited down the subtree — sequencing is a per-container property, so only a node
+ * that itself carries the tag becomes a sequential OmniFocus container. Returns the marked node ids.
+ */
+export function computeSequentialIds(projectNodes: TaskNote[], sequentialTag: string): Set<string> {
+  const ids = new Set<string>();
+  if (!sequentialTag) return ids;
+  for (const node of projectNodes) {
+    if (node.tags.includes(sequentialTag)) ids.add(node.id);
+  }
+  return ids;
+}
+
 export function computeIgnoredTitles(projectNodes: TaskNote[], ignoreTag: string): Set<string> {
   // Build key (basename) -> node map
   const nodeByKey = new Map<string, TaskNote>();

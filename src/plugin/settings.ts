@@ -4,6 +4,13 @@ import type TaskNotesOmniFocusPlugin from "./main.js";
 export interface TaskNotesOmnifocusSettings {
   /** Vault tag that opts a task (or a project subtree) OUT of OmniFocus sync. */
   ignoreTag: string;
+  /**
+   * Vault tag that marks a project-node a SEQUENTIAL OmniFocus container (#8): its OmniFocus mirror runs
+   * children in order and they are sorted by their blockedBy dependencies. A marked top-level project
+   * becomes a sequential project (no longer a single-action list); a marked nested node becomes a
+   * sequential action group. Not inherited — only the tagged node itself. Blank disables the feature.
+   */
+  sequentialTag: string;
   /** Tags never mirrored to OmniFocus (e.g. the TaskNotes marker tag "task" that everything carries). */
   excludeTags: string[];
   /** Depth→type map: hierarchyLevels[depth] ∈ {folder,project,task}; deeper → task. See levels.ts. */
@@ -45,6 +52,7 @@ export interface TaskNotesOmnifocusSettings {
 
 export const DEFAULT_SETTINGS: TaskNotesOmnifocusSettings = {
   ignoreTag: "omnifocus/ignore",
+  sequentialTag: "omnifocus/sequential",
   // The TaskNotes identifier tag is read live from TaskNotes' own settings (see main.ts buildConfig);
   // this list is only for ADDITIONAL tags the user wants kept out of OmniFocus.
   excludeTags: [],
@@ -107,6 +115,21 @@ export class SettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.ignoreTag)
           .onChange(async (value) => {
             this.plugin.settings.ignoreTag = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Sequential tag")
+      .setDesc(
+        "A project-node carrying this tag becomes a sequential OmniFocus container: its children run in order, sorted by their blockedBy dependencies. A marked top-level project becomes a sequential project (not a single-action list). Blank disables.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("omnifocus/sequential")
+          .setValue(this.plugin.settings.sequentialTag)
+          .onChange(async (value) => {
+            this.plugin.settings.sequentialTag = value.trim();
             await this.plugin.saveSettings();
           }),
       );
