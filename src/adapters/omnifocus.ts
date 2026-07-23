@@ -39,8 +39,12 @@ export type OFOp =
   | { op: "updateProject"; primaryKey: string; fields: Partial<OFWriteFields> }
   // #8: reorder the direct children of a sequential container into `orderedPrimaryKeys` order (blockers
   // first). The container is a project (by `project` name) or an action-group task (by `parentPrimaryKey`).
-  // Idempotent: moving children into the order they already hold is a no-op.
-  | { op: "reorder"; project?: string; parentPrimaryKey?: string; orderedPrimaryKeys: string[] };
+  // Idempotent: children already in the requested relative order are not moved (avoids Sync churn).
+  | { op: "reorder"; project?: string; parentPrimaryKey?: string; orderedPrimaryKeys: string[] }
+  // #8: reconcile an EXISTING action-group task's sequential flag to `sequential` (projects are handled by
+  // the scaffold). Needed so a linked nested group that becomes/stops being sequential actually flips —
+  // forestToCreateOps only sets it on CREATE. Idempotent: a matching flag is left untouched.
+  | { op: "setSequential"; parentPrimaryKey: string; sequential: boolean };
 
 export interface BatchResult {
   /** create `ref` (caller correlation id, e.g. taskId) -> new primaryKey */
@@ -364,9 +368,17 @@ export function buildBatchScript(ops: OFOp[]): string {
         if (op.fields.completed === true) { proj.status = Project.Status.Done; }
         else if (op.fields.completed === false) { proj.status = Project.Status.Active; }
         result.updated.push(op.primaryKey);
+      } else if (op.op === 'setSequential') {
+        // #8: flip an existing action-group task's sequential flag (idempotent). Create sets it on new
+        // groups; this reconciles already-linked ones so (un)marking actually takes effect.
+        var grp = Task.byIdentifier(op.parentPrimaryKey);
+        if (!grp) {
+          result.errors.push({ primaryKey: op.parentPrimaryKey, message: 'Sequential-flag task not found: ' + op.parentPrimaryKey });
+          continue;
+        }
+        if (grp.sequential !== op.sequential) { grp.sequential = op.sequential; result.updated.push(op.parentPrimaryKey); }
       } else if (op.op === 'reorder') {
-        // #8: move the named children, in order, to the end of their container — final order matches
-        // orderedPrimaryKeys (blockers first). Container is an action-group task or a project.
+        // #8: order the named children (blockers first). Container is an action-group task or a project.
         var container;
         if (op.parentPrimaryKey) {
           container = Task.byIdentifier(op.parentPrimaryKey);
@@ -377,15 +389,33 @@ export function buildBatchScript(ops: OFOp[]): string {
           result.errors.push({ primaryKey: op.parentPrimaryKey || op.project, message: 'Reorder container not found: ' + (op.parentPrimaryKey || op.project) });
           continue;
         }
-        for (var r = 0; r < op.orderedPrimaryKeys.length; r++) {
-          var childTask = Task.byIdentifier(op.orderedPrimaryKeys[r]);
-          if (childTask) { moveTasks([childTask], container.ending); }
+        // Idempotency: only move when the managed children are NOT already in the requested relative
+        // order — otherwise moveTasks would bump every child's modification date and churn Sync each run.
+        var childList = op.parentPrimaryKey ? container.children : container.tasks;
+        var posByPk = {};
+        for (var q = 0; q < childList.length; q++) { posByPk[childList[q].id.primaryKey] = q; }
+        var inOrder = true, lastPos = -1;
+        for (var s = 0; s < op.orderedPrimaryKeys.length; s++) {
+          var cp = posByPk[op.orderedPrimaryKeys[s]];
+          if (cp === undefined) { continue; } // an unmanaged/unresolved child — ignored for ordering
+          if (cp < lastPos) { inOrder = false; break; }
+          lastPos = cp;
         }
-        result.updated.push(op.parentPrimaryKey || op.project);
+        if (!inOrder) {
+          for (var r = 0; r < op.orderedPrimaryKeys.length; r++) {
+            var childTask = Task.byIdentifier(op.orderedPrimaryKeys[r]);
+            if (childTask) { moveTasks([childTask], container.ending); }
+          }
+          result.updated.push(op.parentPrimaryKey || op.project);
+        }
       }
     } catch (e) {
       var errEntry = { message: String(e) };
-      if (op.op === 'create') { errEntry.ref = op.ref; } else { errEntry.primaryKey = op.primaryKey; }
+      // Identify the failing op: create by ref; reorder by its container (project or parent task); the
+      // rest by primaryKey. (A reorder has no primaryKey, so don't report an undefined one.)
+      if (op.op === 'create') { errEntry.ref = op.ref; }
+      else if (op.op === 'reorder') { errEntry.primaryKey = op.parentPrimaryKey || op.project; }
+      else { errEntry.primaryKey = op.primaryKey || op.parentPrimaryKey; }
       result.errors.push(errEntry);
     }
   }
@@ -491,12 +521,14 @@ export function buildScaffoldScript(folders: FolderSpec[], projects: ProjectSpec
         result.createdProjects.push(projSpec.title);
       }
       // Idempotently set the project type (whether newly created or reused). A sequential project (#8)
-      // and a single-action list are mutually exclusive; sequential clears containsSingletonActions.
+      // and a single-action list are mutually exclusive, so each branch clears the other's flag —
+      // otherwise reverting a project from sequential back to a list would leave it still sequential.
       if (projSpec.sequential) {
         if (proj.containsSingletonActions !== false) { proj.containsSingletonActions = false; }
         if (proj.sequential !== true) { proj.sequential = true; }
-      } else if (projSpec.singleActionList && proj.containsSingletonActions !== true) {
-        proj.containsSingletonActions = true;
+      } else {
+        if (proj.sequential !== false) { proj.sequential = false; }
+        if (projSpec.singleActionList && proj.containsSingletonActions !== true) { proj.containsSingletonActions = true; }
       }
     } catch (e) {
       result.errors.push({ path: projSpec.folderPath.concat([projSpec.title]).join('/'), message: String(e) });

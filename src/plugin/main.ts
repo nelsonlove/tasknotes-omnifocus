@@ -77,8 +77,9 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
     return {
       optInTag: s.ignoreTag, // ignoreTag is the per-task opt-out; optInTag in ReconcileConfig is not used for filtering here
       // Exclude the TaskNotes identifier tag (read live from TaskNotes' own settings, since every task
-      // carries it) plus any additional user-configured excludeTags.
-      excludeTags: [...this.taskNotesMarkerTags(), ...s.excludeTags],
+      // carries it), the internal control tags (ignore / parallel opt-out), and any user excludeTags —
+      // so a control tag is never mirrored into OmniFocus as a real tag. (#8 review)
+      excludeTags: [...this.taskNotesMarkerTags(), s.ignoreTag, s.parallelTag, ...s.excludeTags].filter(Boolean),
       conflict: s.conflict,
       bodyPolicy: s.bodyPolicy,
       desurface: s.desurface,
@@ -583,41 +584,43 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       }
       log.line(`field-reconcile TOTAL: ${fieldApplied} applied, ${fieldConflicts} conflicts`);
 
-      // --- 6b. Sequential ordering (#8): for each container marked sequential, move its direct children
-      //         into blockedBy order (blockers first). Push-authoritative, so pull is skipped. Emitted
-      //         only when the container actually has an intra-container dependency edge (else ordering is
-      //         arbitrary — no churn). Children are already dep-ordered in the forest; we map them to the
-      //         linked primaryKeys and issue one reorder op per container. OF→vault reorder is phase 2.
+      // --- 6b. Sequential ordering (#8): inferred-sequential containers run children in blockedBy order.
+      //         For each LINKED action-group task container, reconcile its sequential flag (both ways —
+      //         so (un)marking takes effect on existing groups; projects are handled by the scaffold),
+      //         and for a sequential container issue a reorder op. Both ops are idempotent in OmniJS (the
+      //         flag is only flipped when it differs; children are only moved when out of order), so an
+      //         unchanged container produces no OmniFocus write / Sync churn. Push-authoritative → pull is
+      //         skipped. OF→vault reorder reflection is phase 2.
       if (direction !== "pull") {
-        const reorderOps: OFOp[] = [];
+        const seqOps: OFOp[] = [];
         const pkOf = (id: string) => this.store.getPrimaryKey(id);
         const emitReorder = (children: import("./hierarchy.js").OFItem[], addr: { project?: string; parentPrimaryKey?: string }) => {
-          const taskChildren = children.filter((c) => c.type === "task");
-          if (taskChildren.length < 2) return;
-          const childIds = new Set(taskChildren.map((c) => c.sourceId));
-          const hasDep = taskChildren.some((c) => depsFor(c.sourceId).some((d) => d !== c.sourceId && childIds.has(d)));
-          if (!hasDep) return; // no ordering constraint among these siblings — leave them be
-          const pks = taskChildren.map((c) => pkOf(c.sourceId)).filter((pk): pk is string => pk != null);
-          if (pks.length < 2) return;
-          reorderOps.push({ op: "reorder", ...addr, orderedPrimaryKeys: pks });
+          const pks = children.filter((c) => c.type === "task").map((c) => pkOf(c.sourceId)).filter((pk): pk is string => pk != null);
+          if (pks.length < 2) return; // nothing to order
+          seqOps.push({ op: "reorder", ...addr, orderedPrimaryKeys: pks });
         };
         for (const proj of projects) {
           if (proj.sequential) emitReorder(proj.tasks, { project: proj.name });
-          const walkSeq = (items: import("./hierarchy.js").OFItem[]): void => {
+          const walk = (items: import("./hierarchy.js").OFItem[]): void => {
             for (const it of items) {
-              if (it.type === "task" && it.sequential && it.children.length > 0) {
+              if (it.type === "task" && it.children.length > 0) {
                 const pk = pkOf(it.sourceId);
-                if (pk) emitReorder(it.children, { parentPrimaryKey: pk });
+                if (pk) {
+                  // Reconcile the existing group's sequential flag (true or false) to the inferred state.
+                  seqOps.push({ op: "setSequential", parentPrimaryKey: pk, sequential: it.sequential });
+                  if (it.sequential) emitReorder(it.children, { parentPrimaryKey: pk });
+                }
               }
-              walkSeq(it.children);
+              walk(it.children);
             }
           };
-          walkSeq(proj.tasks);
+          walk(proj.tasks);
         }
-        if (reorderOps.length) {
-          const br = await omnifocus.applyBatch(reorderOps);
+        if (seqOps.length) {
+          const br = await omnifocus.applyBatch(seqOps);
           errors += br.errors.length;
-          log.line(`sequential: ${reorderOps.length} container(s) reordered by blockedBy, ${br.errors.length} errors`);
+          const reorders = seqOps.filter((o) => o.op === "reorder").length;
+          log.line(`sequential: ${reorders} reorder + ${seqOps.length - reorders} group-flag op(s), ${br.updated.length} applied, ${br.errors.length} errors`);
         }
       }
 

@@ -208,10 +208,26 @@ describe("buildReadScript / buildBatchScript", () => {
     expect(script).toContain("moveTasks");
   });
 
-  it("scaffold script makes a sequential project (not a single-action list) (#8)", () => {
-    const script = buildScaffoldScript([], [{ title: "SeqP", folderPath: [], sequential: true }]);
-    expect(script).toContain("proj.sequential = true");
-    expect(script).toContain("containsSingletonActions = false");
+  it("reorder is idempotent — only moves when children are out of order (#8 review)", () => {
+    const script = buildBatchScript([{ op: "reorder", project: "P", orderedPrimaryKeys: ["a", "b"] }]);
+    // guards the move behind an in-order check so an already-ordered container isn't churned every sync
+    expect(script).toContain("inOrder");
+    expect(script).toContain("if (!inOrder)");
+  });
+
+  it("setSequential reconciles an existing group's flag idempotently (#8 review)", () => {
+    const ops: OFOp[] = [{ op: "setSequential", parentPrimaryKey: "pk1", sequential: true }];
+    const script = buildBatchScript(ops);
+    expect(script).toContain(encodePayload(ops));
+    expect(script).toContain("grp.sequential !== op.sequential");
+  });
+
+  it("scaffold makes a sequential project, and clears sequential when reverting to a list (#8 review)", () => {
+    const seq = buildScaffoldScript([], [{ title: "SeqP", folderPath: [], sequential: true }]);
+    expect(seq).toContain("proj.sequential = true");
+    expect(seq).toContain("containsSingletonActions = false");
+    // the else (single-action list) branch clears a stale sequential flag on revert
+    expect(seq).toContain("proj.sequential = false");
   });
 });
 
