@@ -31,6 +31,18 @@ export interface TaskNotesAdapterOptions {
   /** Status values considered completed (derives TaskNote.isCompleted). */
   completedStatuses: string[];
   authToken?: string;
+  /** Configurable keys for the deferred/flagged userFields; the PUT body must use the user's key. (#10) */
+  fieldKeys?: UserFieldKeys;
+  /**
+   * Sync-safe fallback for the per-task PUT route. The TaskNotes `/api/tasks/:id` route returns a 404 —
+   * or a 2xx with an empty body — for notes living in software-project task dirs (`…/Tasks/`, `…/issues/`,
+   * `…/Tasks for <x>/`) even though the bulk `/query` endpoint indexes them, so `update()`/`setStatus()`
+   * writes to those notes would otherwise be lost. When provided, the adapter routes those writes through
+   * this callback (Obsidian `processFrontMatter` — Obsidian is the writer, so Sync stays consistent),
+   * passing the SAME key/value body the PUT would have sent. If the fallback throws, the write is a real
+   * failure and surfaces to the caller. Genuine errors (non-404 like 500) never trigger the fallback. (#11)
+   */
+  frontmatterFallback?: (id: string, body: Record<string, unknown>) => Promise<void>;
 }
 
 export interface TaskNotesAdapter {
@@ -81,20 +93,52 @@ export function normalizeTNTask(raw: RawTNTask, completedStatuses: string[]): Ta
 }
 
 /**
- * Build the PUT body from core TaskWriteFields (only keys present in `fields`):
- *  title->title, due->due, scheduled->scheduled, deferred->deferred, timeEstimate->timeEstimate,
- *  flagged->flagged, tags->tags,
- *  priority-> the TaskNotes priority string ("none"|"low"|"normal"|"high", symmetric with mapTNPriority).
- *  (deferred and flagged are TaskNotes userFields; verified the REST API accepts and echoes them.)
+ * The core PUT-body keys buildUpdateBody writes (plus `status`, written by setStatus). A configurable
+ * userField key MUST NOT collide with one of these — doing so would clobber the core field in the body
+ * (or, on the read side, read the core field's value as the userField). Exported so the plugin can
+ * disable a colliding mapping and warn. (#10 review)
  */
-export function buildUpdateBody(fields: Partial<TaskWriteFields>): Record<string, unknown> {
+export const CORE_UPDATE_KEYS: ReadonlySet<string> = new Set([
+  "title",
+  "due",
+  "scheduled",
+  "timeEstimate",
+  "tags",
+  "priority",
+  "status",
+]);
+
+/** Configurable frontmatter/API keys for the deferred + flagged userFields (#10). */
+export interface UserFieldKeys {
+  /** API/frontmatter key for the deferred date. Default "deferred"; blank omits the field. */
+  defer?: string;
+  /** API/frontmatter key for the flagged boolean. Default "flagged"; blank omits the field. */
+  flag?: string;
+}
+
+/**
+ * Build the PUT body from core TaskWriteFields (only keys present in `fields`):
+ *  title->title, due->due, scheduled->scheduled, deferred-><deferKey>, timeEstimate->timeEstimate,
+ *  flagged-><flagKey>, tags->tags,
+ *  priority-> the TaskNotes priority string ("none"|"low"|"normal"|"high", symmetric with mapTNPriority).
+ *  deferred and flagged are TaskNotes userFields whose keys are configurable (#10) — the body key must
+ *  match the user's registered userField key. Defaults are "deferred"/"flagged"; a blank key omits it.
+ */
+export function buildUpdateBody(
+  fields: Partial<TaskWriteFields>,
+  fieldKeys?: UserFieldKeys,
+): Record<string, unknown> {
+  const deferKey = fieldKeys?.defer ?? "deferred";
+  const flagKey = fieldKeys?.flag ?? "flagged";
   const body: Record<string, unknown> = {};
   if ("title" in fields) body.title = fields.title;
   if ("due" in fields) body.due = fields.due;
   if ("scheduled" in fields) body.scheduled = fields.scheduled;
-  if ("deferred" in fields) body.deferred = fields.deferred;
+  // Guard: a userField key colliding with a core key would clobber the core field — never let it. (The
+  // plugin also disables a colliding mapping up front and warns; this is the last-line defense.)
+  if ("deferred" in fields && deferKey && !CORE_UPDATE_KEYS.has(deferKey)) body[deferKey] = fields.deferred;
   if ("timeEstimate" in fields) body.timeEstimate = fields.timeEstimate;
-  if ("flagged" in fields) body.flagged = fields.flagged;
+  if ("flagged" in fields && flagKey && !CORE_UPDATE_KEYS.has(flagKey)) body[flagKey] = fields.flagged;
   if ("tags" in fields) body.tags = fields.tags;
   if ("priority" in fields) body.priority = fields.priority; // "none"|"low"|"normal"|"high" pass through
   return body;
@@ -107,12 +151,43 @@ export function buildUpdateBody(fields: Partial<TaskWriteFields>): Record<string
  * failure as "not found".
  */
 export function createTaskNotesAdapter(opts: TaskNotesAdapterOptions): TaskNotesAdapter {
-  const { baseUrl, fetch, completedStatuses, authToken } = opts;
+  const { baseUrl, fetch, completedStatuses, authToken, fieldKeys, frontmatterFallback } = opts;
 
   function authHeaders(): Record<string, string> {
     const headers: Record<string, string> = {};
     if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
     return headers;
+  }
+
+  // The per-task PUT route is "unavailable" (didn't write) when it 404s, or answers 2xx with an empty
+  // body — the observed behavior for notes in software-project task dirs. Only these two shapes trigger
+  // the frontmatter fallback; a genuine error (500, etc.) is NOT masked and still throws. (#11)
+  async function perTaskRouteUnavailable(res: Awaited<ReturnType<FetchLike>>): Promise<boolean> {
+    if (res.status === 404) return true;
+    // A 2xx with an empty body. TaskNotes answers a genuine success with a JSON `{success,data}`
+    // envelope (never empty), so in practice only the unreachable-route case is blank; if a future
+    // build ever 204'd a real success, this would reroute it through the fallback (a redundant but
+    // still-correct vault write, logged as an api-fallback).
+    if (res.ok) return (await res.text()).trim().length === 0;
+    return false;
+  }
+
+  // Shared PUT path for update()/setStatus(): send the body; on route-unavailable with a fallback set,
+  // re-route the SAME body through the sync-safe frontmatter writer; otherwise unwrap/throw as usual.
+  async function putTask(id: string, body: Record<string, unknown>, context: string): Promise<void> {
+    const res = await fetch(`${baseUrl}/api/tasks/${encodeId(id)}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders(),
+      },
+      body: JSON.stringify(body),
+    });
+    if (frontmatterFallback && (await perTaskRouteUnavailable(res))) {
+      await frontmatterFallback(id, body);
+      return;
+    }
+    await throwOnError(res, context);
   }
 
   // TaskNotes ids are vault paths (e.g. "Folder Name/My Task.md"). The `/api/tasks/:id` route
@@ -165,27 +240,11 @@ export function createTaskNotesAdapter(opts: TaskNotesAdapterOptions): TaskNotes
     },
 
     async update(id: string, fields: Partial<TaskWriteFields>): Promise<void> {
-      const res = await fetch(`${baseUrl}/api/tasks/${encodeId(id)}`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          ...authHeaders(),
-        },
-        body: JSON.stringify(buildUpdateBody(fields)),
-      });
-      await throwOnError(res, "update");
+      await putTask(id, buildUpdateBody(fields, fieldKeys), "update");
     },
 
     async setStatus(id: string, status: string): Promise<void> {
-      const res = await fetch(`${baseUrl}/api/tasks/${encodeId(id)}`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          ...authHeaders(),
-        },
-        body: JSON.stringify({ status }),
-      });
-      await throwOnError(res, "setStatus");
+      await putTask(id, { status }, "setStatus");
     },
   };
 }

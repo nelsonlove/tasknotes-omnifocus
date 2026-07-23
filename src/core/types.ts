@@ -138,6 +138,17 @@ export interface ReconcileConfig {
    * null/undefined disables the back-link. Set by the plugin from `app.vault.getName()`.
    */
   obsidianVault?: string | null;
+  /**
+   * Whether the `deferred` ⇄ OmniFocus defer-date mapping is active. false disables it entirely (the
+   * field is neither read from the vault nor reconciled to/from OmniFocus). Defaults to enabled when
+   * absent. Set by the plugin from whether `deferField` is configured. (#10)
+   */
+  syncDefer?: boolean;
+  /**
+   * Whether the `flagged` ⇄ OmniFocus flag mapping is active. false disables it entirely. Defaults to
+   * enabled when absent. Set by the plugin from whether `flagField` is configured. (#10)
+   */
+  syncFlag?: boolean;
 }
 
 export interface ReconcileInput {

@@ -128,6 +128,25 @@ describe("buildUpdateBody", () => {
       scheduled: "2026-07-18T00:00:00.000Z",
     });
   });
+
+  it("emits the configured userField keys for deferred/flagged (#10)", () => {
+    expect(
+      buildUpdateBody({ deferred: "2026-07-17T00:00:00.000Z", flagged: true }, { defer: "deferDate", flag: "isFlagged" }),
+    ).toEqual({ deferDate: "2026-07-17T00:00:00.000Z", isFlagged: true });
+  });
+
+  it("omits a userField when its configured key is blank (mapping disabled) (#10)", () => {
+    expect(buildUpdateBody({ deferred: "2026-07-17T00:00:00.000Z", flagged: true }, { defer: "", flag: "" })).toEqual({});
+  });
+
+  it("never lets a userField key collide with and clobber a core field key (#10 review)", () => {
+    // deferField misconfigured to "due" must NOT overwrite the real due value in the body.
+    const body = buildUpdateBody({ due: "2026-07-20T00:00:00.000Z", deferred: "2026-07-17T00:00:00.000Z" }, { defer: "due" });
+    expect(body.due).toBe("2026-07-20T00:00:00.000Z");
+    // flagField misconfigured to "priority" must not overwrite priority with a boolean.
+    const body2 = buildUpdateBody({ priority: "high", flagged: true }, { flag: "priority" });
+    expect(body2.priority).toBe("high");
+  });
 });
 
 describe("adapter.query", () => {
@@ -177,6 +196,76 @@ describe("adapter.update / setStatus", () => {
     expect(url).toBe("http://localhost:8080/api/tasks/a.md");
     expect(init.method).toBe("PUT");
     expect(JSON.parse(init.body)).toEqual({ status: "done" });
+  });
+});
+
+describe("adapter.update / setStatus — per-task-route fallback (#11)", () => {
+  /** A fetch returning a canned status/body pair, so we can simulate the route being unavailable. */
+  function stubFetch(opts: { status: number; ok: boolean; text?: string; json?: unknown }) {
+    return vi.fn(async () => ({
+      ok: opts.ok,
+      status: opts.status,
+      json: async () => opts.json ?? {},
+      text: async () => opts.text ?? "",
+    })) as unknown as FetchLike & ReturnType<typeof vi.fn>;
+  }
+
+  it("falls back to frontmatterFallback (with the mapped body) on a 404, without throwing", async () => {
+    const fetch = stubFetch({ status: 404, ok: false, text: "" });
+    const fallback = vi.fn(async () => {});
+    const adapter = createTaskNotesAdapter({
+      baseUrl: "http://localhost:8080",
+      fetch,
+      completedStatuses: COMPLETED,
+      frontmatterFallback: fallback,
+    });
+    await expect(adapter.update("dir/Tasks/a.md", { flagged: true })).resolves.toBeUndefined();
+    expect(fallback).toHaveBeenCalledWith("dir/Tasks/a.md", { flagged: true });
+  });
+
+  it("falls back on a 2xx with an empty body (route no-op)", async () => {
+    const fetch = stubFetch({ status: 200, ok: true, text: "   " });
+    const fallback = vi.fn(async () => {});
+    const adapter = createTaskNotesAdapter({
+      baseUrl: "http://localhost:8080",
+      fetch,
+      completedStatuses: COMPLETED,
+      frontmatterFallback: fallback,
+    });
+    await adapter.setStatus("dir/issues/a.md", "done");
+    expect(fallback).toHaveBeenCalledWith("dir/issues/a.md", { status: "done" });
+  });
+
+  it("does NOT fall back on a normal success (fallback untouched)", async () => {
+    const fetch = fakeFetch({ success: true, data: {} });
+    const fallback = vi.fn(async () => {});
+    const adapter = createTaskNotesAdapter({
+      baseUrl: "http://localhost:8080",
+      fetch,
+      completedStatuses: COMPLETED,
+      frontmatterFallback: fallback,
+    });
+    await adapter.update("normal.md", { title: "X" });
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
+  it("still throws on a 404 when no fallback is configured (preserves prior behavior)", async () => {
+    const fetch = stubFetch({ status: 404, ok: false, text: "" });
+    const adapter = createTaskNotesAdapter({ baseUrl: "http://localhost:8080", fetch, completedStatuses: COMPLETED });
+    await expect(adapter.update("dir/Tasks/a.md", { flagged: true })).rejects.toThrow(/404/);
+  });
+
+  it("does NOT fall back on a genuine 500 — a real error still throws even with a fallback set", async () => {
+    const fetch = stubFetch({ status: 500, ok: false });
+    const fallback = vi.fn(async () => {});
+    const adapter = createTaskNotesAdapter({
+      baseUrl: "http://localhost:8080",
+      fetch,
+      completedStatuses: COMPLETED,
+      frontmatterFallback: fallback,
+    });
+    await expect(adapter.update("a.md", { title: "X" })).rejects.toThrow(/500/);
+    expect(fallback).not.toHaveBeenCalled();
   });
 });
 
