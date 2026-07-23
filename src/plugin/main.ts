@@ -17,7 +17,7 @@ import { validateHierarchyLevels, DEFAULT_HIERARCHY_LEVELS } from "./levels.js";
 import type { OFLevelType } from "./levels.js";
 import { readOmnifocusUrl, readDescription, readBody, readDeferred, readFlagged, writeOmnifocusUrl, clearOmnifocusUrl, writeTaskFrontmatter } from "./frontmatter.js";
 import { RunLog } from "./runlog.js";
-import { validateUserField } from "./userfields.js";
+import { validateUserField, resolveFieldKey } from "./userfields.js";
 import { sanitizeFilename, filterUncaptured, buildCaptureFrontmatter } from "./inbox.js";
 import { createTaskNotesAdapter } from "../adapters/tasknotes.js";
 import { createOmniFocusAdapter, defaultRunOmniJS } from "../adapters/omnifocus.js";
@@ -85,9 +85,34 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       doneStatus: s.doneStatus,
       reopenStatus: s.reopenStatus,
       obsidianVault: this.app.vault.getName(),
-      // #10: a blank field key disables that userField mapping entirely (not read, not reconciled).
-      syncDefer: s.deferField.trim() !== "",
-      syncFlag: s.flagField.trim() !== "",
+      // #10: a blank/disabled field key drops that userField mapping entirely (not read, not reconciled).
+      // effectiveFieldKeys() also disables a key that collides with a core field or is whitespace-only.
+      syncDefer: this.effectiveFieldKeys().defer !== "",
+      syncFlag: this.effectiveFieldKeys().flag !== "",
+    };
+  }
+
+  /**
+   * The effective (normalized) deferred/flagged userField keys plus any config warnings. Trims each
+   * configured key and disables (blanks) one that collides with a core task field — a colliding or
+   * whitespace-padded key would otherwise read/write the wrong frontmatter property. Used consistently
+   * for reads, the adapter's PUT-body keys, the sync-enable flags, and validation. (#10 review)
+   */
+  private effectiveFieldKeys(): { defer: string; flag: string; warnings: string[] } {
+    const warnings: string[] = [];
+    const resolve = (raw: string, label: string): string => {
+      const { key, collision } = resolveFieldKey(raw);
+      if (collision) {
+        warnings.push(
+          `The ${label} field key "${raw.trim()}" collides with a built-in task field — the ${label} mapping is disabled to avoid corrupting that field. Choose a distinct userField key in this plugin's settings.`,
+        );
+      }
+      return key;
+    };
+    return {
+      defer: resolve(this.settings.deferField, "deferred"),
+      flag: resolve(this.settings.flagField, "flagged"),
+      warnings,
     };
   }
 
@@ -146,6 +171,11 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
     const log = new RunLog(this.app, this.manifest.dir ?? ".");
     try {
       const config = this.buildConfig();
+      // Effective (trimmed, collision-checked) userField keys — used for the adapter, reads, and validation.
+      const fieldKeys = this.effectiveFieldKeys();
+      // #11 review: count how many writes fell back to frontmatter, so a spike (a real API-route
+      // regression, not just software-project-dir notes) is visible in the run log rather than masked.
+      let apiFallbacks = 0;
       const tasknotes = createTaskNotesAdapter({
         baseUrl: this.settings.taskNotesApi,
         // Use Obsidian's requestUrl (not the browser fetch) — the renderer blocks cross-origin
@@ -175,13 +205,14 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         },
         completedStatuses: this.settings.completedStatuses,
         authToken: this.settings.authToken,
-        // #10: the PUT body must use the user's configured userField keys, not the hardcoded defaults.
-        fieldKeys: { defer: this.settings.deferField, flag: this.settings.flagField },
+        // #10: the PUT body must use the user's configured (normalized) userField keys, not the defaults.
+        fieldKeys: { defer: fieldKeys.defer, flag: fieldKeys.flag },
         // #11: notes in software-project task dirs (…/Tasks/, …/issues/) 404 on the per-task PUT route,
         // so field-reconcile writes to them would be lost. Re-route those through Obsidian's frontmatter
         // API (sync-safe) with the same body, and log that the fallback fired.
         frontmatterFallback: async (id, body) => {
           await writeTaskFrontmatter(this.app, id, body);
+          apiFallbacks++;
           log.line(`[api-fallback] per-task route unavailable for ${id}; wrote ${Object.keys(body).join(", ")} via frontmatter`);
         },
       });
@@ -190,12 +221,14 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       const ignoreTag = this.settings.ignoreTag;
       log.line(`direction=${direction} dryRun=${dryRun} vault=${config.obsidianVault}`);
 
-      // #10: warn (don't block) if a configured userField key isn't a matching TaskNotes userField —
-      // catches "set the field name but never created the userField" and type mismatches.
+      // #10: warn (don't block) on a misconfigured userField key — a collision with a core field
+      // (disables the mapping), a key that isn't a registered TaskNotes userField ("set the field name
+      // but never created the userField"), or a type mismatch. Validate the EFFECTIVE (normalized) keys.
       const userFields = this.taskNotesUserFields();
       for (const w of [
-        validateUserField(userFields, this.settings.deferField.trim(), "date", "deferred"),
-        validateUserField(userFields, this.settings.flagField.trim(), "boolean", "flagged"),
+        ...fieldKeys.warnings,
+        validateUserField(userFields, fieldKeys.defer, "date", "deferred"),
+        validateUserField(userFields, fieldKeys.flag, "boolean", "flagged"),
       ]) {
         if (w) {
           log.line(`[userfield] WARNING: ${w}`);
@@ -228,9 +261,9 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         t.body = await readBody(app, t.id);
         // `deferred` and `flagged` are TaskNotes userFields the /query API doesn't return — read from
         // the metadata cache (same as description/omnifocusUrl) so reconcile sees the real vault values.
-        // Keys are configurable (#10); a blank key returns null/false (mapping disabled).
-        t.deferred = readDeferred(app, t.id, this.settings.deferField);
-        t.flagged = readFlagged(app, t.id, this.settings.flagField);
+        // Keys are configurable (#10); a blank/disabled key returns null/false (mapping disabled).
+        t.deferred = readDeferred(app, t.id, fieldKeys.defer);
+        t.flagged = readFlagged(app, t.id, fieldKeys.flag);
       }
 
       // Drop ignored LEAF tasks (pruneIgnored only removes ignored project-node subtrees).
@@ -674,6 +707,9 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
 
       await this.saveData({ settings: this.settings, state: this.store.toJSON() });
       log.line(`enrich: ${projectOps.length} project-field updates, ${enrichVaultWrites} vault writes`);
+      if (apiFallbacks > 0) {
+        log.line(`api-fallback: ${apiFallbacks} write(s) rerouted through frontmatter (per-task API route unavailable — expected for notes in software-project task dirs; a large count may indicate an API-route regression).`);
+      }
       log.line(`TOTAL: ${created} tasks created, ${stamped} linked, ${errors} errors`);
 
       // Verification: re-read OF and compare to what we intended, so the log catches "created N but

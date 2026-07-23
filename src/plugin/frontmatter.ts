@@ -60,9 +60,7 @@ export async function readBody(app: App, path: string): Promise<string | null> {
 
 /** Stamp the link identity into frontmatter after a create (sync-safe). */
 export async function writeOmnifocusUrl(app: App, path: string, url: string): Promise<void> {
-  const f = fileFor(app, path);
-  if (!f) return;
-  await app.fileManager.processFrontMatter(f, (fm) => {
+  await mutateFrontmatter(app, path, (fm) => {
     fm.omnifocusUrl = url;
   });
 }
@@ -73,23 +71,42 @@ export async function writeOmnifocusUrl(app: App, path: string, url: string): Pr
  * key/value body Obsidian-side via processFrontMatter — a `null`/`undefined` value DELETES the key (a
  * field "clear"), matching how the API PUT clears a field. Throws if the note isn't found, so the caller
  * records a genuine failure rather than a silently-dropped write.
+ *
+ * LIMITATIONS (best-effort last resort — it is NOT the TaskNotes API): the body keys are written to
+ * frontmatter verbatim, so this does NOT apply TaskNotes' configurable field-mapping (a user who remapped
+ * e.g. `due`→`dueDate` would get the wrong key), and a `status` write does NOT reproduce the API's
+ * completion side-effects (`completedDate`, recurring-instance regeneration). Correct for the default
+ * identity field-mapping and plain (non-recurring) tasks — the case this path exists for.
  */
 export async function writeTaskFrontmatter(app: App, path: string, body: Record<string, unknown>): Promise<void> {
-  const f = fileFor(app, path);
-  if (!f) throw new Error(`TaskNotes frontmatter fallback: note not found at ${path}`);
-  await app.fileManager.processFrontMatter(f, (fm) => {
+  const ok = await mutateFrontmatter(app, path, (fm) => {
     for (const [k, v] of Object.entries(body)) {
       if (v === null || v === undefined) delete fm[k];
       else fm[k] = v;
     }
   });
+  if (!ok) throw new Error(`TaskNotes frontmatter fallback: note not found at ${path}`);
 }
 
 /** Remove the link identity from frontmatter (on clearLink / de-surface). */
 export async function clearOmnifocusUrl(app: App, path: string): Promise<void> {
-  const f = fileFor(app, path);
-  if (!f) return;
-  await app.fileManager.processFrontMatter(f, (fm) => {
+  await mutateFrontmatter(app, path, (fm) => {
     delete fm.omnifocusUrl;
   });
+}
+
+/**
+ * Shared sync-safe frontmatter mutation: resolve the file, run `mutate` inside processFrontMatter
+ * (Obsidian is the writer, so Sync stays consistent). Returns false (a no-op) when the note is missing —
+ * callers that require the write to land check the result and surface an error.
+ */
+async function mutateFrontmatter(
+  app: App,
+  path: string,
+  mutate: (fm: Record<string, unknown>) => void,
+): Promise<boolean> {
+  const f = fileFor(app, path);
+  if (!f) return false;
+  await app.fileManager.processFrontMatter(f, mutate);
+  return true;
 }

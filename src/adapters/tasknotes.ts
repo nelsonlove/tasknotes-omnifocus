@@ -92,6 +92,22 @@ export function normalizeTNTask(raw: RawTNTask, completedStatuses: string[]): Ta
   };
 }
 
+/**
+ * The core PUT-body keys buildUpdateBody writes (plus `status`, written by setStatus). A configurable
+ * userField key MUST NOT collide with one of these — doing so would clobber the core field in the body
+ * (or, on the read side, read the core field's value as the userField). Exported so the plugin can
+ * disable a colliding mapping and warn. (#10 review)
+ */
+export const CORE_UPDATE_KEYS: ReadonlySet<string> = new Set([
+  "title",
+  "due",
+  "scheduled",
+  "timeEstimate",
+  "tags",
+  "priority",
+  "status",
+]);
+
 /** Configurable frontmatter/API keys for the deferred + flagged userFields (#10). */
 export interface UserFieldKeys {
   /** API/frontmatter key for the deferred date. Default "deferred"; blank omits the field. */
@@ -118,9 +134,11 @@ export function buildUpdateBody(
   if ("title" in fields) body.title = fields.title;
   if ("due" in fields) body.due = fields.due;
   if ("scheduled" in fields) body.scheduled = fields.scheduled;
-  if ("deferred" in fields && deferKey) body[deferKey] = fields.deferred;
+  // Guard: a userField key colliding with a core key would clobber the core field — never let it. (The
+  // plugin also disables a colliding mapping up front and warns; this is the last-line defense.)
+  if ("deferred" in fields && deferKey && !CORE_UPDATE_KEYS.has(deferKey)) body[deferKey] = fields.deferred;
   if ("timeEstimate" in fields) body.timeEstimate = fields.timeEstimate;
-  if ("flagged" in fields && flagKey) body[flagKey] = fields.flagged;
+  if ("flagged" in fields && flagKey && !CORE_UPDATE_KEYS.has(flagKey)) body[flagKey] = fields.flagged;
   if ("tags" in fields) body.tags = fields.tags;
   if ("priority" in fields) body.priority = fields.priority; // "none"|"low"|"normal"|"high" pass through
   return body;
@@ -146,6 +164,10 @@ export function createTaskNotesAdapter(opts: TaskNotesAdapterOptions): TaskNotes
   // the frontmatter fallback; a genuine error (500, etc.) is NOT masked and still throws. (#11)
   async function perTaskRouteUnavailable(res: Awaited<ReturnType<FetchLike>>): Promise<boolean> {
     if (res.status === 404) return true;
+    // A 2xx with an empty body. TaskNotes answers a genuine success with a JSON `{success,data}`
+    // envelope (never empty), so in practice only the unreachable-route case is blank; if a future
+    // build ever 204'd a real success, this would reroute it through the fallback (a redundant but
+    // still-correct vault write, logged as an api-fallback).
     if (res.ok) return (await res.text()).trim().length === 0;
     return false;
   }

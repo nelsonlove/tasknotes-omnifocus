@@ -3,12 +3,26 @@
 // here. TaskNotes stores userFields as an array of { id, displayName, key, type } (verified live: type
 // is "date" for the deferred field, "boolean" for the flagged field).
 
+import { CORE_UPDATE_KEYS } from "../adapters/tasknotes.js";
+
 /** A TaskNotes userField entry (the subset we read). */
 export interface TNUserField {
   id?: string;
   key?: string;
   displayName?: string;
   type?: string;
+}
+
+/**
+ * Normalize a configured userField key: trim surrounding whitespace (a padded key would silently target
+ * the wrong frontmatter property), and reject a key that collides with a core task field (which would
+ * clobber that field on read and write). A collision or blank input yields an empty key (mapping
+ * disabled). Returns the effective key plus whether a collision was the reason it was cleared. (#10 review)
+ */
+export function resolveFieldKey(raw: string): { key: string; collision: boolean } {
+  const key = (raw ?? "").trim();
+  if (key && CORE_UPDATE_KEYS.has(key)) return { key: "", collision: true };
+  return { key, collision: false };
 }
 
 /**

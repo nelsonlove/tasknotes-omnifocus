@@ -138,6 +138,15 @@ describe("buildUpdateBody", () => {
   it("omits a userField when its configured key is blank (mapping disabled) (#10)", () => {
     expect(buildUpdateBody({ deferred: "2026-07-17T00:00:00.000Z", flagged: true }, { defer: "", flag: "" })).toEqual({});
   });
+
+  it("never lets a userField key collide with and clobber a core field key (#10 review)", () => {
+    // deferField misconfigured to "due" must NOT overwrite the real due value in the body.
+    const body = buildUpdateBody({ due: "2026-07-20T00:00:00.000Z", deferred: "2026-07-17T00:00:00.000Z" }, { defer: "due" });
+    expect(body.due).toBe("2026-07-20T00:00:00.000Z");
+    // flagField misconfigured to "priority" must not overwrite priority with a boolean.
+    const body2 = buildUpdateBody({ priority: "high", flagged: true }, { flag: "priority" });
+    expect(body2.priority).toBe("high");
+  });
 });
 
 describe("adapter.query", () => {
