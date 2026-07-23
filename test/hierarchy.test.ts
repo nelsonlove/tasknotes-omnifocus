@@ -224,3 +224,63 @@ describe("robustness", () => {
     expect(findContainmentAnomalies(buildOFForest(FIXTURE, leafName, DEFAULT))).toEqual([]);
   });
 });
+
+// =====================================================================
+describe("inferred sequential containers + blockedBy ordering (#8)", () => {
+  // Cat's direct children (B, C, Task A) carry an intra-container dependency edge, so Cat is INFERRED
+  // sequential (no tag): a.md blockedBy c.md, b.md blockedBy a.md → order C, Task A, B.
+  const depMap: Record<string, string[]> = { "a.md": ["c.md"], "b.md": ["a.md"] };
+  const forest = buildOFForest(FIXTURE, leafName, DEFAULT, { depsFor: (id) => depMap[id] ?? [] });
+
+  it("infers sequential from an intra-container dependency; leaves dep-free containers parallel", () => {
+    expect(find(forest, "Cat")!.sequential).toBe(true); // has intra-child deps
+    expect(find(forest, "B")!.sequential).toBe(false); // its children g/h have no deps
+    expect(find(forest, "Area")!.sequential).toBe(false); // folders never sequential
+  });
+
+  it("orders the inferred-sequential container's children by blockedBy (blockers first)", () => {
+    expect(find(forest, "Cat")!.children.map((c) => c.name)).toEqual(["C", "Task A", "B"]);
+  });
+
+  it("does NOT infer sequential from a cross-container dependency", () => {
+    // a.md blocked by something outside Cat → not an intra-container edge → Cat stays parallel.
+    const f = buildOFForest(FIXTURE, leafName, DEFAULT, { depsFor: (id) => (id === "a.md" ? ["outside.md"] : []) });
+    expect(find(f, "Cat")!.sequential).toBe(false);
+  });
+
+  it("the parallel opt-out forces a dependency-bearing container parallel (unordered)", () => {
+    const f = buildOFForest(FIXTURE, leafName, DEFAULT, {
+      depsFor: (id) => depMap[id] ?? [],
+      isForcedParallel: (id) => id === "cat.md",
+    });
+    expect(find(f, "Cat")!.sequential).toBe(false);
+    // original child order preserved (no topo reordering when parallel)
+    expect(find(f, "Cat")!.children.map((c) => c.name)).toEqual(["B", "C", "Task A"]);
+  });
+
+  it("disables inference entirely when depsFor is omitted (global off switch)", () => {
+    const f = buildOFForest(FIXTURE, leafName, DEFAULT); // no opts → no depsFor → nothing sequential
+    expect(f.every(function check(it): boolean {
+      return it.sequential === false && it.children.every(check);
+    })).toBe(true);
+  });
+
+  it("collectProjects surfaces the inferred sequential flag", () => {
+    expect(collectProjects(forest).find((p) => p.name === "Cat")!.sequential).toBe(true);
+  });
+
+  it("forestToCreateOps marks an inferred-sequential action group's create op sequential:true", () => {
+    // Give group B an intra-child dep (g blockedBy h) → B inferred sequential; C stays parallel.
+    const f2 = buildOFForest(FIXTURE, leafName, DEFAULT, { depsFor: (id) => (id === "g.md" ? ["h.md"] : []) });
+    const proj = collectProjects(f2).find((p) => p.name === "Cat")!;
+    const fields = (): OFWriteFields => ({
+      name: "x", note: null, dueDate: null, deferDate: null, plannedDate: null,
+      estimatedMinutes: null, flagged: false, tags: [], completed: false,
+    });
+    const ops = forestToCreateOps("Cat", proj.tasks, fields);
+    const bOp = ops.find((o) => o.op === "create" && o.ref === "b.md");
+    expect(bOp && "sequential" in bOp && bOp.sequential).toBe(true);
+    const cOp = ops.find((o) => o.op === "create" && o.ref === "c.md");
+    expect(cOp && "sequential" in cOp && cOp.sequential).toBe(false);
+  });
+});

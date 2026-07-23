@@ -10,12 +10,13 @@ import {
   buildHasSubtasksFilter,
   buildProjectNodeInputs,
   computeIgnoredTitles,
+  computeParallelIds,
   pruneIgnored,
 } from "./discovery.js";
 import { buildOFForest, collectFolders, collectProjects, forestToCreateOps } from "./hierarchy.js";
 import { validateHierarchyLevels, DEFAULT_HIERARCHY_LEVELS } from "./levels.js";
 import type { OFLevelType } from "./levels.js";
-import { readOmnifocusUrl, readDescription, readBody, readDeferred, readFlagged, writeOmnifocusUrl, clearOmnifocusUrl, writeTaskFrontmatter } from "./frontmatter.js";
+import { readOmnifocusUrl, readDescription, readBody, readDeferred, readFlagged, readBlockedBy, writeOmnifocusUrl, clearOmnifocusUrl, writeTaskFrontmatter } from "./frontmatter.js";
 import { RunLog } from "./runlog.js";
 import { validateUserField, resolveFieldKey } from "./userfields.js";
 import { sanitizeFilename, filterUncaptured, buildCaptureFrontmatter } from "./inbox.js";
@@ -76,8 +77,9 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
     return {
       optInTag: s.ignoreTag, // ignoreTag is the per-task opt-out; optInTag in ReconcileConfig is not used for filtering here
       // Exclude the TaskNotes identifier tag (read live from TaskNotes' own settings, since every task
-      // carries it) plus any additional user-configured excludeTags.
-      excludeTags: [...this.taskNotesMarkerTags(), ...s.excludeTags],
+      // carries it), the internal control tags (ignore / parallel opt-out), and any user excludeTags —
+      // so a control tag is never mirrored into OmniFocus as a real tag. (#8 review)
+      excludeTags: [...this.taskNotesMarkerTags(), s.ignoreTag, s.parallelTag, ...s.excludeTags].filter(Boolean),
       conflict: s.conflict,
       bodyPolicy: s.bodyPolicy,
       desurface: s.desurface,
@@ -255,6 +257,9 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
       const taskById = new Map<string, TaskNote>();
       for (const n of projectNodes) taskById.set(n.id, n);
       for (const [id, t] of leafById) taskById.set(id, t);
+      // #8: each task's blockedBy dependencies (resolved to task ids), used to order a sequential
+      // container's children. Read alongside the other frontmatter-only fields.
+      const depsById = new Map<string, string[]>();
       for (const t of filterIgnored([...taskById.values()], ignoreTag)) {
         t.description = readDescription(app, t.id);
         t.omnifocusUrl = readOmnifocusUrl(app, t.id);
@@ -264,14 +269,23 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         // Keys are configurable (#10); a blank/disabled key returns null/false (mapping disabled).
         t.deferred = readDeferred(app, t.id, fieldKeys.defer);
         t.flagged = readFlagged(app, t.id, fieldKeys.flag);
+        depsById.set(t.id, readBlockedBy(app, t.id));
       }
+      // #8: sequencing is INFERRED from blockedBy edges; parallelIds are the opt-out (force parallel).
+      const parallelIds = computeParallelIds(projectNodes, this.settings.parallelTag);
+      const depsFor = (id: string) => depsById.get(id) ?? [];
 
       // Drop ignored LEAF tasks (pruneIgnored only removes ignored project-node subtrees).
       const isIgnored = (id: string) => (taskById.get(id)?.tags ?? []).includes(ignoreTag);
       const scoped = pruned.map((inp) => ({ ...inp, leafTaskIds: inp.leafTaskIds.filter((id) => !isIgnored(id)) }));
 
       // --- 2. Map subtree depth → OmniFocus folders / single-action projects / (nested) tasks. ---
-      const forest = buildOFForest(scoped, (id) => taskById.get(id)?.title ?? id, levels);
+      // #8: infer sequential containers from blockedBy edges (opt out per-container via parallelIds, or
+      // globally via inferSequential). Passing no depsFor disables inference entirely (all parallel).
+      const forest = buildOFForest(scoped, (id) => taskById.get(id)?.title ?? id, levels, {
+        depsFor: this.settings.inferSequential ? depsFor : undefined,
+        isForcedParallel: (id) => parallelIds.has(id),
+      });
       const folders = collectFolders(forest);
       const projects = collectProjects(forest);
       log.line(`discover: ${projectNodes.length} project-nodes, ${childTasks.length} child-tasks`);
@@ -387,12 +401,14 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         return;
       }
 
-      // --- 3. Ensure the folder/project skeleton (projects are single-action lists). ---
+      // --- 3. Ensure the folder/project skeleton (projects are single-action lists, unless marked
+      //        sequential (#8), which is mutually exclusive with a single-action list). ---
       const folderSpecs: FolderSpec[] = folders.map((f) => ({ path: [...f.path, f.name] }));
       const projectSpecs: ProjectSpec[] = projects.map((p) => ({
         title: p.name,
         folderPath: p.folderPath,
-        singleActionList: true,
+        singleActionList: !p.sequential,
+        sequential: p.sequential,
       }));
       const scaffold = await omnifocus.ensureStructure(folderSpecs, projectSpecs);
       let created = 0;
@@ -568,6 +584,45 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         }
       }
       log.line(`field-reconcile TOTAL: ${fieldApplied} applied, ${fieldConflicts} conflicts`);
+
+      // --- 6b. Sequential flag reconcile (#8): an inferred-sequential nested ACTION GROUP that already
+      //         exists in OmniFocus (linked, not created this run) needs its sequential flag flipped on —
+      //         forestToCreateOps only sets it on CREATE, and the scaffold only handles top-level projects.
+      //         Idempotent in OmniJS (flag flipped only when it differs). Push-authoritative → pull skipped.
+      //         Children of already-existing containers are NOT reordered here (a fresh push creates them in
+      //         dependency order; in-place reorder of pre-existing children is phase 2). For observability,
+      //         log how many containers inference made sequential.
+      if (direction !== "pull" && this.settings.inferSequential) {
+        const seqOps: OFOp[] = [];
+        const pkOf = (id: string) => this.store.getPrimaryKey(id);
+        let seqProjects = 0;
+        let seqGroups = 0;
+        for (const proj of projects) {
+          if (proj.sequential) seqProjects++;
+          const walk = (items: import("./hierarchy.js").OFItem[]): void => {
+            for (const it of items) {
+              if (it.type === "task" && it.sequential && it.children.length > 0) {
+                seqGroups++;
+                // Only EXISTING groups need a flag flip; ones created this run already got sequential:true.
+                const pk = pkOf(it.sourceId);
+                if (pk && !createdIds.has(it.sourceId)) {
+                  seqOps.push({ op: "setSequential", parentPrimaryKey: pk, sequential: true });
+                }
+              }
+              walk(it.children);
+            }
+          };
+          walk(proj.tasks);
+        }
+        if (seqProjects || seqGroups) {
+          log.line(`sequential (inferred from blockedBy): ${seqProjects} project(s), ${seqGroups} action group(s)`);
+        }
+        if (seqOps.length) {
+          const br = await omnifocus.applyBatch(seqOps);
+          errors += br.errors.length;
+          log.line(`sequential: ${seqOps.length} existing group flag op(s), ${br.updated.length} flipped, ${br.errors.length} errors`);
+        }
+      }
 
       // --- 7. Inbox capture: pull OmniFocus INBOX tasks (no containing project) into the vault as new
       //        TaskNotes, in the user-configured destination folder. Runs only on pull/sync and only

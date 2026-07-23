@@ -195,6 +195,32 @@ describe("buildReadScript / buildBatchScript", () => {
     expect(script).toContain("new Folder");
     expect(script).toContain("new Project");
   });
+
+  it("batch script sets a sequential action group on create (#8)", () => {
+    const ops: OFOp[] = [
+      { op: "create", ref: "g", project: "P", sequential: true, fields: writeFields({ name: "Group" }) },
+    ];
+    const script = buildBatchScript(ops);
+    expect(script).toContain(encodePayload(ops));
+    expect(script).toContain("newTask.sequential = true");
+  });
+
+  it("setSequential reconciles an existing group's flag idempotently (#8 review)", () => {
+    const ops: OFOp[] = [{ op: "setSequential", parentPrimaryKey: "pk1", sequential: true }];
+    const script = buildBatchScript(ops);
+    expect(script).toContain(encodePayload(ops));
+    expect(script).toContain("grp.sequential !== op.sequential");
+    // in-place reordering of existing children is deferred to phase 2 — no move primitive in the script
+    expect(script).not.toContain("moveTasks");
+  });
+
+  it("scaffold makes a sequential project, and clears sequential when reverting to a list (#8 review)", () => {
+    const seq = buildScaffoldScript([], [{ title: "SeqP", folderPath: [], sequential: true }]);
+    expect(seq).toContain("proj.sequential = true");
+    expect(seq).toContain("containsSingletonActions = false");
+    // the else (single-action list) branch clears a stale sequential flag on revert
+    expect(seq).toContain("proj.sequential = false");
+  });
 });
 
 describe("buildReadAllProjectsScript", () => {

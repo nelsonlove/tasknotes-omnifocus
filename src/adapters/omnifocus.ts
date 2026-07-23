@@ -36,7 +36,13 @@ export type OFOp =
   | { op: "delete"; primaryKey: string }
   // "enrich" a PROJECT's own root-task fields (due/defer/flag/note/completion). primaryKey is the
   // project's primaryKey. Completion maps to Project.Status (Done/Active); name/tags are not written.
-  | { op: "updateProject"; primaryKey: string; fields: Partial<OFWriteFields> };
+  | { op: "updateProject"; primaryKey: string; fields: Partial<OFWriteFields> }
+  // #8: reconcile an EXISTING action-group task's sequential flag to `sequential` (projects are handled by
+  // the scaffold). Needed so a linked nested group that becomes sequential actually flips — forestToCreateOps
+  // only sets it on CREATE. Idempotent: a matching flag is left untouched. (Ordering of already-existing
+  // children — an in-place reorder — is deferred to phase 2; on a fresh push children are CREATED in
+  // dependency order, so no reorder is needed there.)
+  | { op: "setSequential"; parentPrimaryKey: string; sequential: boolean };
 
 export interface BatchResult {
   /** create `ref` (caller correlation id, e.g. taskId) -> new primaryKey */
@@ -58,6 +64,12 @@ export interface ProjectSpec {
   folderPath: string[];
   /** When true, mark the project a single-action list (`containsSingletonActions = true`). Idempotent. */
   singleActionList?: boolean;
+  /**
+   * #8: when true, mark the project SEQUENTIAL (`sequential = true`, and clear `containsSingletonActions`
+   * since the two are mutually exclusive). Idempotent. `sequential` and `singleActionList` should not
+   * both be set for one project — the plugin sends one or the other.
+   */
+  sequential?: boolean;
 }
 
 export interface ScaffoldResult {
@@ -317,8 +329,9 @@ export function buildBatchScript(ops: OFOp[]): string {
           newTask = new Task(op.fields.name || 'Untitled', proj.ending);
         }
         setTaskFields(newTask, op.fields);
-        // A task with children is an action group; sequential:false makes it parallel.
+        // A task with children is an action group; sequential:false makes it parallel, true serial (#8).
         if (op.sequential === false) { newTask.sequential = false; }
+        else if (op.sequential === true) { newTask.sequential = true; }
         if (op.fields.completed) { newTask.markComplete(); }
         refMap[op.ref] = newTask;
         result.created[op.ref] = newTask.id.primaryKey;
@@ -353,10 +366,21 @@ export function buildBatchScript(ops: OFOp[]): string {
         if (op.fields.completed === true) { proj.status = Project.Status.Done; }
         else if (op.fields.completed === false) { proj.status = Project.Status.Active; }
         result.updated.push(op.primaryKey);
+      } else if (op.op === 'setSequential') {
+        // #8: flip an existing action-group task's sequential flag (idempotent). Create sets it on new
+        // groups; this reconciles already-linked ones so (un)marking actually takes effect.
+        var grp = Task.byIdentifier(op.parentPrimaryKey);
+        if (!grp) {
+          result.errors.push({ primaryKey: op.parentPrimaryKey, message: 'Sequential-flag task not found: ' + op.parentPrimaryKey });
+          continue;
+        }
+        if (grp.sequential !== op.sequential) { grp.sequential = op.sequential; result.updated.push(op.parentPrimaryKey); }
       }
     } catch (e) {
       var errEntry = { message: String(e) };
-      if (op.op === 'create') { errEntry.ref = op.ref; } else { errEntry.primaryKey = op.primaryKey; }
+      // Identify the failing op: create by ref; setSequential by its parent task; the rest by primaryKey.
+      if (op.op === 'create') { errEntry.ref = op.ref; }
+      else { errEntry.primaryKey = op.primaryKey || op.parentPrimaryKey; }
       result.errors.push(errEntry);
     }
   }
@@ -461,9 +485,15 @@ export function buildScaffoldScript(folders: FolderSpec[], projects: ProjectSpec
         }
         result.createdProjects.push(projSpec.title);
       }
-      // Idempotently mark single-action lists (whether newly created or reused).
-      if (projSpec.singleActionList && proj.containsSingletonActions !== true) {
-        proj.containsSingletonActions = true;
+      // Idempotently set the project type (whether newly created or reused). A sequential project (#8)
+      // and a single-action list are mutually exclusive, so each branch clears the other's flag —
+      // otherwise reverting a project from sequential back to a list would leave it still sequential.
+      if (projSpec.sequential) {
+        if (proj.containsSingletonActions !== false) { proj.containsSingletonActions = false; }
+        if (proj.sequential !== true) { proj.sequential = true; }
+      } else {
+        if (proj.sequential !== false) { proj.sequential = false; }
+        if (projSpec.singleActionList && proj.containsSingletonActions !== true) { proj.containsSingletonActions = true; }
       }
     } catch (e) {
       result.errors.push({ path: projSpec.folderPath.concat([projSpec.title]).join('/'), message: String(e) });

@@ -4,6 +4,20 @@ import type TaskNotesOmniFocusPlugin from "./main.js";
 export interface TaskNotesOmnifocusSettings {
   /** Vault tag that opts a task (or a project subtree) OUT of OmniFocus sync. */
   ignoreTag: string;
+  /**
+   * Master switch for #8 blockedBy→sequential inference. When true (default), a container whose children
+   * carry a blockedBy dependency among themselves becomes a sequential OmniFocus container. When false,
+   * NO inference runs and every project stays a single-action list (the pre-#8 behavior) — a global escape
+   * hatch, since inference silently changes existing projects that happen to have dependencies.
+   */
+  inferSequential: boolean;
+  /**
+   * Vault tag that forces a project-node PARALLEL (#8) — the per-container opt-out from inferred sequencing.
+   * A container with a blockedBy dependency among its children is otherwise made a sequential OmniFocus
+   * container. Tagging the node keeps it parallel/single-action. Not inherited — only the tagged node.
+   * Blank disables the opt-out.
+   */
+  parallelTag: string;
   /** Tags never mirrored to OmniFocus (e.g. the TaskNotes marker tag "task" that everything carries). */
   excludeTags: string[];
   /** Depth→type map: hierarchyLevels[depth] ∈ {folder,project,task}; deeper → task. See levels.ts. */
@@ -45,6 +59,8 @@ export interface TaskNotesOmnifocusSettings {
 
 export const DEFAULT_SETTINGS: TaskNotesOmnifocusSettings = {
   ignoreTag: "omnifocus/ignore",
+  inferSequential: true,
+  parallelTag: "omnifocus/parallel",
   // The TaskNotes identifier tag is read live from TaskNotes' own settings (see main.ts buildConfig);
   // this list is only for ADDITIONAL tags the user wants kept out of OmniFocus.
   excludeTags: [],
@@ -107,6 +123,33 @@ export class SettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.ignoreTag)
           .onChange(async (value) => {
             this.plugin.settings.ignoreTag = value.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Infer sequential from dependencies")
+      .setDesc(
+        "When on, a project/group whose tasks have blockedBy dependencies among themselves becomes a sequential OmniFocus container, ordered by those dependencies (new tasks are created in order). Turn off to keep every project a single-action list regardless of dependencies (pre-#8 behavior).",
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.inferSequential).onChange(async (value) => {
+          this.plugin.settings.inferSequential = value;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Parallel tag (per-container opt-out)")
+      .setDesc(
+        "Tag a project-node with this to keep it parallel/single-action even when its tasks have dependencies (e.g. partial dependencies where the independent tasks should stay available). Blank disables the opt-out.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("omnifocus/parallel")
+          .setValue(this.plugin.settings.parallelTag)
+          .onChange(async (value) => {
+            this.plugin.settings.parallelTag = value.trim();
             await this.plugin.saveSettings();
           }),
       );

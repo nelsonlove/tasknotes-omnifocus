@@ -179,6 +179,21 @@ export function buildProjectNodeInputs(
  * `ignoreTag`. Cycle-guarded. Returns the set of ignored node KEYS. Implement to satisfy
  * test/discovery.test.ts.
  */
+/**
+ * The ids of project-nodes forced PARALLEL via `parallelTag` (#8) — the opt-out from inferred sequencing.
+ * A container with a blockedBy edge among its children is inferred sequential; tagging it keeps it
+ * parallel/single-action anyway (for partial-dependency containers whose independent siblings should stay
+ * available). Per-container, not inherited. Returns the tagged node ids.
+ */
+export function computeParallelIds(projectNodes: TaskNote[], parallelTag: string): Set<string> {
+  const ids = new Set<string>();
+  if (!parallelTag) return ids;
+  for (const node of projectNodes) {
+    if (node.tags.includes(parallelTag)) ids.add(node.id);
+  }
+  return ids;
+}
+
 export function computeIgnoredTitles(projectNodes: TaskNote[], ignoreTag: string): Set<string> {
   // Build key (basename) -> node map
   const nodeByKey = new Map<string, TaskNote>();

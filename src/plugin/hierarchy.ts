@@ -11,6 +11,7 @@
 import type { ProjectNodeInput } from "./tree.js";
 import { typeAtDepth } from "./levels.js";
 import type { OFLevelType } from "./levels.js";
+import { orderByDeps } from "./topo.js";
 import type { OFOp } from "../adapters/omnifocus.js";
 import type { OFWriteFields } from "../core/types.js";
 
@@ -20,8 +21,23 @@ export interface OFItem {
   /** OmniFocus display name: a project-node's key (basename) or a leaf task's title. */
   name: string;
   type: OFLevelType;
+  /**
+   * Whether this container was marked sequential (#8) — its OmniFocus mirror runs children in order
+   * (a sequential project, or a sequential action group) and its direct children are ordered by their
+   * blockedBy dependencies. Only meaningful for `project`/`task` container nodes; always false for folders.
+   */
+  sequential: boolean;
   /** Direct OmniFocus children (folders/projects under a folder; tasks under a project or task). */
   children: OFItem[];
+}
+
+/** Optional sequencing inputs for buildOFForest (#8): each task's blockers + the parallel opt-out. */
+export interface ForestOptions {
+  /** The blocker task ids for a task id (its blockedBy). A container with an intra-container edge is
+   *  INFERRED sequential — no manual tag; the dependency data is the signal. */
+  depsFor?: (sourceId: string) => string[];
+  /** True if the node id names a container the user forced parallel (opt-out) despite having deps. */
+  isForcedParallel?: (sourceId: string) => boolean;
 }
 
 /**
@@ -43,6 +59,7 @@ export function buildOFForest(
   nodes: ProjectNodeInput[],
   leafName: (id: string) => string,
   levels: OFLevelType[],
+  opts: ForestOptions = {},
 ): OFItem[] {
   // Index nodes by title (key) for O(1) child lookup
   const byTitle = new Map<string, ProjectNodeInput>();
@@ -67,7 +84,7 @@ export function buildOFForest(
     const newAncestors = new Set(ancestors).add(input.title);
 
     // Expand child project-nodes, skipping unknowns and cycle ancestors
-    const children: OFItem[] = [];
+    let children: OFItem[] = [];
     for (const childKey of input.childProjects) {
       if (ancestors.has(childKey)) continue; // cycle guard
       const childInput = byTitle.get(childKey);
@@ -81,10 +98,31 @@ export function buildOFForest(
     for (const id of input.leafTaskIds) {
       if (placed.has(id)) continue; // already placed under an earlier parent
       placed.add(id);
-      children.push({ sourceId: id, name: leafName(id), type: "task", children: [] });
+      children.push({ sourceId: id, name: leafName(id), type: "task", sequential: false, children: [] });
     }
 
-    return { sourceId: input.id, name: input.title, type, children };
+    // #8: only project/task containers can be sequential (a folder holds projects, not ordered tasks).
+    // INFER sequential from the data: a container with a blockedBy edge BETWEEN its own direct children
+    // is ordered, so it becomes a sequential container — no manual tag. The `omnifocus/parallel` opt-out
+    // forces it parallel anyway (e.g. partial deps where the independent siblings should stay available).
+    // When sequential, order the direct children by their dependencies (blockers first).
+    const isContainer = type === "project" || type === "task";
+    let sequential = false;
+    if (isContainer && opts.depsFor) {
+      const depsFor = opts.depsFor;
+      const childIds = new Set(children.map((c) => c.sourceId));
+      const hasIntraDep = children.some((c) =>
+        depsFor(c.sourceId).some((d) => d !== c.sourceId && childIds.has(d)),
+      );
+      sequential = hasIntraDep && !(opts.isForcedParallel?.(input.id) ?? false);
+      if (sequential) {
+        const ordered = orderByDeps(children.map((c) => c.sourceId), depsFor);
+        const byId = new Map(children.map((c) => [c.sourceId, c]));
+        children = ordered.map((id) => byId.get(id)!);
+      }
+    }
+
+    return { sourceId: input.id, name: input.title, type, sequential, children };
   }
 
   // Roots = nodes with empty parents, expanded at depth 0
@@ -113,6 +151,8 @@ export interface ProjectPlacement {
   folderPath: string[];
   /** The project's task forest (its `task`-typed children subtree). */
   tasks: OFItem[];
+  /** #8: this project was marked sequential — scaffold it as a sequential project (not a single-action list). */
+  sequential: boolean;
 }
 
 /**
@@ -152,6 +192,7 @@ export function collectProjects(forest: OFItem[]): ProjectPlacement[] {
           name: item.name,
           folderPath: ancestorFolders,
           tasks: item.children,
+          sequential: item.sequential,
         });
         // Still recurse in case there are nested structures inside the project
         walk(item.children, ancestorFolders);
@@ -205,7 +246,8 @@ export function forestToCreateOps(
       const op: OFOp = { op: "create", ref: n.sourceId, project, fields: fieldsFor(n.sourceId, n.name) };
       if (parent.ref !== undefined) op.parentRef = parent.ref;
       else if (parent.pk !== undefined) op.parentPrimaryKey = parent.pk;
-      if (n.children.length > 0) op.sequential = false;
+      // An action group is parallel by default; mark it sequential (#8) when the container is marked.
+      if (n.children.length > 0) op.sequential = n.sequential === true;
       ops.push(op);
       walk(n.children, { ref: n.sourceId });
     }
