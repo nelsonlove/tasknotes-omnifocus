@@ -63,6 +63,24 @@ export async function writeOmnifocusUrl(app: App, path: string, url: string): Pr
   });
 }
 
+/**
+ * Sync-safe fallback for the TaskNotes per-task PUT route (#11). That route 404s / no-ops for notes in
+ * software-project task dirs, so field-reconcile's writes to them are otherwise lost. Write the same
+ * key/value body Obsidian-side via processFrontMatter — a `null`/`undefined` value DELETES the key (a
+ * field "clear"), matching how the API PUT clears a field. Throws if the note isn't found, so the caller
+ * records a genuine failure rather than a silently-dropped write.
+ */
+export async function writeTaskFrontmatter(app: App, path: string, body: Record<string, unknown>): Promise<void> {
+  const f = fileFor(app, path);
+  if (!f) throw new Error(`TaskNotes frontmatter fallback: note not found at ${path}`);
+  await app.fileManager.processFrontMatter(f, (fm) => {
+    for (const [k, v] of Object.entries(body)) {
+      if (v === null || v === undefined) delete fm[k];
+      else fm[k] = v;
+    }
+  });
+}
+
 /** Remove the link identity from frontmatter (on clearLink / de-surface). */
 export async function clearOmnifocusUrl(app: App, path: string): Promise<void> {
   const f = fileFor(app, path);

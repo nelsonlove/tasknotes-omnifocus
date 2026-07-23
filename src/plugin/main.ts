@@ -15,7 +15,7 @@ import {
 import { buildOFForest, collectFolders, collectProjects, forestToCreateOps } from "./hierarchy.js";
 import { validateHierarchyLevels, DEFAULT_HIERARCHY_LEVELS } from "./levels.js";
 import type { OFLevelType } from "./levels.js";
-import { readOmnifocusUrl, readDescription, readBody, readDeferred, readFlagged, writeOmnifocusUrl, clearOmnifocusUrl } from "./frontmatter.js";
+import { readOmnifocusUrl, readDescription, readBody, readDeferred, readFlagged, writeOmnifocusUrl, clearOmnifocusUrl, writeTaskFrontmatter } from "./frontmatter.js";
 import { RunLog } from "./runlog.js";
 import { sanitizeFilename, filterUncaptured, buildCaptureFrontmatter } from "./inbox.js";
 import { createTaskNotesAdapter } from "../adapters/tasknotes.js";
@@ -161,6 +161,13 @@ export default class TaskNotesOmniFocusPlugin extends Plugin {
         },
         completedStatuses: this.settings.completedStatuses,
         authToken: this.settings.authToken,
+        // #11: notes in software-project task dirs (…/Tasks/, …/issues/) 404 on the per-task PUT route,
+        // so field-reconcile writes to them would be lost. Re-route those through Obsidian's frontmatter
+        // API (sync-safe) with the same body, and log that the fallback fired.
+        frontmatterFallback: async (id, body) => {
+          await writeTaskFrontmatter(this.app, id, body);
+          log.line(`[api-fallback] per-task route unavailable for ${id}; wrote ${Object.keys(body).join(", ")} via frontmatter`);
+        },
       });
       const omnifocus = createOmniFocusAdapter(defaultRunOmniJS);
       const app = this.app;

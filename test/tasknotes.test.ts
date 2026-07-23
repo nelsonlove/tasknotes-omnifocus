@@ -180,6 +180,76 @@ describe("adapter.update / setStatus", () => {
   });
 });
 
+describe("adapter.update / setStatus — per-task-route fallback (#11)", () => {
+  /** A fetch returning a canned status/body pair, so we can simulate the route being unavailable. */
+  function stubFetch(opts: { status: number; ok: boolean; text?: string; json?: unknown }) {
+    return vi.fn(async () => ({
+      ok: opts.ok,
+      status: opts.status,
+      json: async () => opts.json ?? {},
+      text: async () => opts.text ?? "",
+    })) as unknown as FetchLike & ReturnType<typeof vi.fn>;
+  }
+
+  it("falls back to frontmatterFallback (with the mapped body) on a 404, without throwing", async () => {
+    const fetch = stubFetch({ status: 404, ok: false, text: "" });
+    const fallback = vi.fn(async () => {});
+    const adapter = createTaskNotesAdapter({
+      baseUrl: "http://localhost:8080",
+      fetch,
+      completedStatuses: COMPLETED,
+      frontmatterFallback: fallback,
+    });
+    await expect(adapter.update("dir/Tasks/a.md", { flagged: true })).resolves.toBeUndefined();
+    expect(fallback).toHaveBeenCalledWith("dir/Tasks/a.md", { flagged: true });
+  });
+
+  it("falls back on a 2xx with an empty body (route no-op)", async () => {
+    const fetch = stubFetch({ status: 200, ok: true, text: "   " });
+    const fallback = vi.fn(async () => {});
+    const adapter = createTaskNotesAdapter({
+      baseUrl: "http://localhost:8080",
+      fetch,
+      completedStatuses: COMPLETED,
+      frontmatterFallback: fallback,
+    });
+    await adapter.setStatus("dir/issues/a.md", "done");
+    expect(fallback).toHaveBeenCalledWith("dir/issues/a.md", { status: "done" });
+  });
+
+  it("does NOT fall back on a normal success (fallback untouched)", async () => {
+    const fetch = fakeFetch({ success: true, data: {} });
+    const fallback = vi.fn(async () => {});
+    const adapter = createTaskNotesAdapter({
+      baseUrl: "http://localhost:8080",
+      fetch,
+      completedStatuses: COMPLETED,
+      frontmatterFallback: fallback,
+    });
+    await adapter.update("normal.md", { title: "X" });
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
+  it("still throws on a 404 when no fallback is configured (preserves prior behavior)", async () => {
+    const fetch = stubFetch({ status: 404, ok: false, text: "" });
+    const adapter = createTaskNotesAdapter({ baseUrl: "http://localhost:8080", fetch, completedStatuses: COMPLETED });
+    await expect(adapter.update("dir/Tasks/a.md", { flagged: true })).rejects.toThrow(/404/);
+  });
+
+  it("does NOT fall back on a genuine 500 — a real error still throws even with a fallback set", async () => {
+    const fetch = stubFetch({ status: 500, ok: false });
+    const fallback = vi.fn(async () => {});
+    const adapter = createTaskNotesAdapter({
+      baseUrl: "http://localhost:8080",
+      fetch,
+      completedStatuses: COMPLETED,
+      frontmatterFallback: fallback,
+    });
+    await expect(adapter.update("a.md", { title: "X" })).rejects.toThrow(/500/);
+    expect(fallback).not.toHaveBeenCalled();
+  });
+});
+
 describe("adapter.getById", () => {
   it("returns null on a genuine 404 (task not found)", async () => {
     const fetch = fakeFetch({ success: false, error: "not found" }, false, 404);

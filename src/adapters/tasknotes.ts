@@ -31,6 +31,16 @@ export interface TaskNotesAdapterOptions {
   /** Status values considered completed (derives TaskNote.isCompleted). */
   completedStatuses: string[];
   authToken?: string;
+  /**
+   * Sync-safe fallback for the per-task PUT route. The TaskNotes `/api/tasks/:id` route returns a 404 —
+   * or a 2xx with an empty body — for notes living in software-project task dirs (`…/Tasks/`, `…/issues/`,
+   * `…/Tasks for <x>/`) even though the bulk `/query` endpoint indexes them, so `update()`/`setStatus()`
+   * writes to those notes would otherwise be lost. When provided, the adapter routes those writes through
+   * this callback (Obsidian `processFrontMatter` — Obsidian is the writer, so Sync stays consistent),
+   * passing the SAME key/value body the PUT would have sent. If the fallback throws, the write is a real
+   * failure and surfaces to the caller. Genuine errors (non-404 like 500) never trigger the fallback. (#11)
+   */
+  frontmatterFallback?: (id: string, body: Record<string, unknown>) => Promise<void>;
 }
 
 export interface TaskNotesAdapter {
@@ -107,12 +117,39 @@ export function buildUpdateBody(fields: Partial<TaskWriteFields>): Record<string
  * failure as "not found".
  */
 export function createTaskNotesAdapter(opts: TaskNotesAdapterOptions): TaskNotesAdapter {
-  const { baseUrl, fetch, completedStatuses, authToken } = opts;
+  const { baseUrl, fetch, completedStatuses, authToken, frontmatterFallback } = opts;
 
   function authHeaders(): Record<string, string> {
     const headers: Record<string, string> = {};
     if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
     return headers;
+  }
+
+  // The per-task PUT route is "unavailable" (didn't write) when it 404s, or answers 2xx with an empty
+  // body — the observed behavior for notes in software-project task dirs. Only these two shapes trigger
+  // the frontmatter fallback; a genuine error (500, etc.) is NOT masked and still throws. (#11)
+  async function perTaskRouteUnavailable(res: Awaited<ReturnType<FetchLike>>): Promise<boolean> {
+    if (res.status === 404) return true;
+    if (res.ok) return (await res.text()).trim().length === 0;
+    return false;
+  }
+
+  // Shared PUT path for update()/setStatus(): send the body; on route-unavailable with a fallback set,
+  // re-route the SAME body through the sync-safe frontmatter writer; otherwise unwrap/throw as usual.
+  async function putTask(id: string, body: Record<string, unknown>, context: string): Promise<void> {
+    const res = await fetch(`${baseUrl}/api/tasks/${encodeId(id)}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders(),
+      },
+      body: JSON.stringify(body),
+    });
+    if (frontmatterFallback && (await perTaskRouteUnavailable(res))) {
+      await frontmatterFallback(id, body);
+      return;
+    }
+    await throwOnError(res, context);
   }
 
   // TaskNotes ids are vault paths (e.g. "Folder Name/My Task.md"). The `/api/tasks/:id` route
@@ -165,27 +202,11 @@ export function createTaskNotesAdapter(opts: TaskNotesAdapterOptions): TaskNotes
     },
 
     async update(id: string, fields: Partial<TaskWriteFields>): Promise<void> {
-      const res = await fetch(`${baseUrl}/api/tasks/${encodeId(id)}`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          ...authHeaders(),
-        },
-        body: JSON.stringify(buildUpdateBody(fields)),
-      });
-      await throwOnError(res, "update");
+      await putTask(id, buildUpdateBody(fields), "update");
     },
 
     async setStatus(id: string, status: string): Promise<void> {
-      const res = await fetch(`${baseUrl}/api/tasks/${encodeId(id)}`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          ...authHeaders(),
-        },
-        body: JSON.stringify({ status }),
-      });
-      await throwOnError(res, "setStatus");
+      await putTask(id, { status }, "setStatus");
     },
   };
 }
