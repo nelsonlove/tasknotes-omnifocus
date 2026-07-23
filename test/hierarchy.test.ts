@@ -258,6 +258,13 @@ describe("inferred sequential containers + blockedBy ordering (#8)", () => {
     expect(find(f, "Cat")!.children.map((c) => c.name)).toEqual(["B", "C", "Task A"]);
   });
 
+  it("disables inference entirely when depsFor is omitted (global off switch)", () => {
+    const f = buildOFForest(FIXTURE, leafName, DEFAULT); // no opts → no depsFor → nothing sequential
+    expect(f.every(function check(it): boolean {
+      return it.sequential === false && it.children.every(check);
+    })).toBe(true);
+  });
+
   it("collectProjects surfaces the inferred sequential flag", () => {
     expect(collectProjects(forest).find((p) => p.name === "Cat")!.sequential).toBe(true);
   });

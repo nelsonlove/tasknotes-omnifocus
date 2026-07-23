@@ -37,13 +37,11 @@ export type OFOp =
   // "enrich" a PROJECT's own root-task fields (due/defer/flag/note/completion). primaryKey is the
   // project's primaryKey. Completion maps to Project.Status (Done/Active); name/tags are not written.
   | { op: "updateProject"; primaryKey: string; fields: Partial<OFWriteFields> }
-  // #8: reorder the direct children of a sequential container into `orderedPrimaryKeys` order (blockers
-  // first). The container is a project (by `project` name) or an action-group task (by `parentPrimaryKey`).
-  // Idempotent: children already in the requested relative order are not moved (avoids Sync churn).
-  | { op: "reorder"; project?: string; parentPrimaryKey?: string; orderedPrimaryKeys: string[] }
   // #8: reconcile an EXISTING action-group task's sequential flag to `sequential` (projects are handled by
-  // the scaffold). Needed so a linked nested group that becomes/stops being sequential actually flips —
-  // forestToCreateOps only sets it on CREATE. Idempotent: a matching flag is left untouched.
+  // the scaffold). Needed so a linked nested group that becomes sequential actually flips — forestToCreateOps
+  // only sets it on CREATE. Idempotent: a matching flag is left untouched. (Ordering of already-existing
+  // children — an in-place reorder — is deferred to phase 2; on a fresh push children are CREATED in
+  // dependency order, so no reorder is needed there.)
   | { op: "setSequential"; parentPrimaryKey: string; sequential: boolean };
 
 export interface BatchResult {
@@ -377,44 +375,11 @@ export function buildBatchScript(ops: OFOp[]): string {
           continue;
         }
         if (grp.sequential !== op.sequential) { grp.sequential = op.sequential; result.updated.push(op.parentPrimaryKey); }
-      } else if (op.op === 'reorder') {
-        // #8: order the named children (blockers first). Container is an action-group task or a project.
-        var container;
-        if (op.parentPrimaryKey) {
-          container = Task.byIdentifier(op.parentPrimaryKey);
-        } else {
-          container = flattenedProjects.find(function (p) { return p.name === op.project; });
-        }
-        if (!container) {
-          result.errors.push({ primaryKey: op.parentPrimaryKey || op.project, message: 'Reorder container not found: ' + (op.parentPrimaryKey || op.project) });
-          continue;
-        }
-        // Idempotency: only move when the managed children are NOT already in the requested relative
-        // order — otherwise moveTasks would bump every child's modification date and churn Sync each run.
-        var childList = op.parentPrimaryKey ? container.children : container.tasks;
-        var posByPk = {};
-        for (var q = 0; q < childList.length; q++) { posByPk[childList[q].id.primaryKey] = q; }
-        var inOrder = true, lastPos = -1;
-        for (var s = 0; s < op.orderedPrimaryKeys.length; s++) {
-          var cp = posByPk[op.orderedPrimaryKeys[s]];
-          if (cp === undefined) { continue; } // an unmanaged/unresolved child — ignored for ordering
-          if (cp < lastPos) { inOrder = false; break; }
-          lastPos = cp;
-        }
-        if (!inOrder) {
-          for (var r = 0; r < op.orderedPrimaryKeys.length; r++) {
-            var childTask = Task.byIdentifier(op.orderedPrimaryKeys[r]);
-            if (childTask) { moveTasks([childTask], container.ending); }
-          }
-          result.updated.push(op.parentPrimaryKey || op.project);
-        }
       }
     } catch (e) {
       var errEntry = { message: String(e) };
-      // Identify the failing op: create by ref; reorder by its container (project or parent task); the
-      // rest by primaryKey. (A reorder has no primaryKey, so don't report an undefined one.)
+      // Identify the failing op: create by ref; setSequential by its parent task; the rest by primaryKey.
       if (op.op === 'create') { errEntry.ref = op.ref; }
-      else if (op.op === 'reorder') { errEntry.primaryKey = op.parentPrimaryKey || op.project; }
       else { errEntry.primaryKey = op.primaryKey || op.parentPrimaryKey; }
       result.errors.push(errEntry);
     }
